@@ -1663,15 +1663,20 @@ describe('computeCompositeScore', () => {
   });
 
   it('drops null components AND their weight from the denominator (per spec §6)', () => {
-    // No median data — score should equal recency_bonus alone (the only non-null component).
+    // No median data + no seller — only recency_bonus (100, weight 0.10) and
+    // is_lowest_30d_bonus (0 because false, weight 0.05) remain. The is_lowest
+    // bonus is ALWAYS pushed (per impl, it's defined as 0 when 30d history is
+    // missing; spec §6 footnote makes the same call). So:
+    //   numerator   = 100 * 0.10 + 0 * 0.05 = 10
+    //   denominator = 0.10 + 0.05            = 0.15
+    //   score       = 10 / 0.15              ≈ 66.67
     const s = computeCompositeScore({
       current_price_usd: 1500,
       median_30d: null, median_90d: null,
       seller_rating: null, is_lowest_30d: false,
       last_seen: Date.now(),
     });
-    // recency_bonus: 100 if <30min; with weight 0.10 in numerator AND denominator → score = 100
-    expect(s).toBeCloseTo(100, 0);
+    expect(s).toBeCloseTo(66.67, 1);
   });
 
   it('treats negative pct_below_median (above median) as a low score', () => {
@@ -1824,7 +1829,7 @@ git commit -m "feat(pipeline): composite score formula with null-component-drops
 ```typescript
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { enrichBatch, type DirtySet } from '../../src/pipeline/enrich';
+import { enrichBatch, dirtyKey, type DirtySet } from '../../src/pipeline/enrich';
 
 // We mock Keepa's HTTP layer rather than the higher-level client wrapper so the
 // integration of fetchProducts → enrichBatch → D1 is exercised end-to-end.
@@ -1865,10 +1870,10 @@ describe('enrichBatch', () => {
     const snaps = await env.DB.prepare('SELECT COUNT(*) AS n FROM snapshots WHERE asin = ?').bind('B0ENRICH01').first<any>();
     expect(snaps.n).toBe(4);
 
-    expect(dirty.has('B0ENRICH01__new')).toBe(true);
-    expect(dirty.has('B0ENRICH01__used-good')).toBe(true);
-    expect(dirty.has('B0ENRICH01__refurbished')).toBe(true);
-    expect(dirty.has('B0ENRICH01__warehouse')).toBe(true);
+    expect(dirty.has(dirtyKey('B0ENRICH01', 'new'))).toBe(true);
+    expect(dirty.has(dirtyKey('B0ENRICH01', 'used-good'))).toBe(true);
+    expect(dirty.has(dirtyKey('B0ENRICH01', 'refurbished'))).toBe(true);
+    expect(dirty.has(dirtyKey('B0ENRICH01', 'warehouse'))).toBe(true);
   });
 
   it('marks offers no longer present as available=0', async () => {
@@ -1892,7 +1897,7 @@ describe('enrichBatch', () => {
     const used = await env.DB.prepare('SELECT available FROM offers WHERE offer_id = ?').bind('B0DROP01__used-good__').first<any>();
     expect(used.available).toBe(0);
     // Dirty set still includes used-good so score recompute can drop it from current_view
-    expect(dirty.has('B0DROP01__used-good')).toBe(true);
+    expect(dirty.has(dirtyKey('B0DROP01', 'used-good'))).toBe(true);
   });
 
   it('updates products.title and products.last_refreshed on refresh', async () => {
@@ -1907,6 +1912,26 @@ describe('enrichBatch', () => {
     const p = await env.DB.prepare('SELECT title, last_refreshed FROM products WHERE asin = ?').bind('B0REFRESH01').first<any>();
     expect(p.title).toContain('Updated Title');
     expect(p.last_refreshed).toBeGreaterThan(1000);
+  });
+
+  it('preserves the Keepa-aggregate row but unavailables stale per-seller rows for same (asin, condition)', async () => {
+    await seedCategoryAndProduct('B0SELL01');
+    // Pre-seed a per-seller offer (suffix `s:SELLER123`) — should be unavailabled by enrich.
+    await env.DB.prepare(
+      `INSERT INTO offers (offer_id, asin, condition, price_usd, seller, seller_id, source, first_seen, last_seen, available)
+       VALUES ('B0SELL01__used-good__s:SELLER123', 'B0SELL01', 'used-good', 1450, 'Foo', 'SELLER123', 'browser-scrape', 1000, 1000, 1)`
+    ).run();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 520,
+      products: [mockKeepaProduct('B0SELL01', 'GIGABYTE GeForce RTX 5090 32G',
+        [-1, 200000, 159999, -1, -1, -1, -1, -1, -1, -1])],   // used = $1599.99
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    await enrichBatch(env, ['B0SELL01'], new Set());
+    const aggregate = await env.DB.prepare('SELECT available FROM offers WHERE offer_id = ?').bind('B0SELL01__used-good__').first<any>();
+    const perSeller = await env.DB.prepare('SELECT available FROM offers WHERE offer_id = ?').bind('B0SELL01__used-good__s:SELLER123').first<any>();
+    expect(aggregate.available).toBe(1);   // refreshed Keepa-aggregate row stays alive
+    expect(perSeller.available).toBe(0);   // pre-existing per-seller row gets unavailabled
   });
 
   it('skips products whose title fails inferModelFromTitle (accessory or wrong model)', async () => {
@@ -1943,9 +1968,20 @@ import { fetchProducts } from '../keepa/client';
 import { inferModelFromTitle, extractGpuAttrs } from '../extract/gpu';
 import { upsertProduct, upsertOffer, markOffersUnavailable, insertSnapshot } from '../db/client';
 
-/** Cron tracks dirty (asin, condition) tuples so score-recompute only walks changed rows. */
+/**
+ * Cron tracks dirty (asin, condition) tuples so score-recompute only walks
+ * changed rows. Key uses U+001F (unit separator) — disallowed in both ASINs
+ * (alphanumeric only) and condition slugs (lower-kebab) — so split is
+ * unambiguous regardless of future condition values containing underscores.
+ */
 export type DirtySet = Set<string>;
-const dirtyKey = (asin: string, condition: string) => `${asin}__${condition}`;
+export const DIRTY_SEP = '\x1f';
+export const dirtyKey = (asin: string, condition: string) => `${asin}${DIRTY_SEP}${condition}`;
+export const parseDirtyKey = (key: string): { asin: string; condition: string } => {
+  const i = key.indexOf(DIRTY_SEP);
+  if (i < 0) throw new Error(`malformed dirty key: ${key}`);
+  return { asin: key.slice(0, i), condition: key.slice(i + 1) };
+};
 
 // Keepa CSV indices (per spec §6 / Keepa docs)
 const PRICE_IDX: Array<{ idx: number; cond: GpuCondition }> = [
@@ -2221,6 +2257,7 @@ git commit -m "feat(pipeline): discover phase — Keepa /search rotation per cat
 import { describe, it, expect } from 'vitest';
 import { env } from 'cloudflare:test';
 import { recomputeScoresForDirty } from '../../src/pipeline/score-recompute';
+import { dirtyKey } from '../../src/pipeline/enrich';
 
 const seed = async () => {
   await env.DB.prepare(
@@ -2251,7 +2288,7 @@ describe('recomputeScoresForDirty', () => {
     await seedProductWithOffer('B0RECOMP01', '5090', 'used-good', 1500, now - 5 * 60_000);
     await seedSnapshots('B0RECOMP01', 'used-good', [1500, 1700, 1800, 1900, 2000], now);
 
-    await recomputeScoresForDirty(env, new Set(['B0RECOMP01__used-good']));
+    await recomputeScoresForDirty(env, new Set([dirtyKey('B0RECOMP01', 'used-good')]));
 
     const v = await env.DB.prepare('SELECT * FROM current_view WHERE asin = ? AND condition = ?').bind('B0RECOMP01', 'used-good').first<any>();
     expect(v).not.toBeNull();
@@ -2273,7 +2310,7 @@ describe('recomputeScoresForDirty', () => {
     // Now mark all offers unavailable (simulating Keepa dropping the listing)
     await env.DB.prepare(`UPDATE offers SET available = 0 WHERE asin = ?`).bind('B0GONE01').run();
 
-    await recomputeScoresForDirty(env, new Set(['B0GONE01__used-good']));
+    await recomputeScoresForDirty(env, new Set([dirtyKey('B0GONE01', 'used-good')]));
     const v = await env.DB.prepare('SELECT * FROM current_view WHERE asin = ? AND condition = ?').bind('B0GONE01', 'used-good').first<any>();
     expect(v).toBeNull();
   });
@@ -2283,7 +2320,7 @@ describe('recomputeScoresForDirty', () => {
     const now = Date.now();
     await seedProductWithOffer('B0MSRP01', '5090', 'used-good', 1500, now);
     await seedSnapshots('B0MSRP01', 'used-good', [1500], now);
-    await recomputeScoresForDirty(env, new Set(['B0MSRP01__used-good']));
+    await recomputeScoresForDirty(env, new Set([dirtyKey('B0MSRP01', 'used-good')]));
     const v = await env.DB.prepare('SELECT pct_off_msrp, msrp_baseline FROM current_view WHERE asin = ? AND condition = ?').bind('B0MSRP01', 'used-good').first<any>();
     expect(v.msrp_baseline).toBe(1999);
     expect(v.pct_off_msrp).toBeCloseTo(((1999 - 1500) / 1999) * 100, 1);  // ~24.96%
@@ -2307,6 +2344,7 @@ import type { GpuCondition } from '../db/types';
 import { computeMedian } from './median';
 import { computeCompositeScore } from './score';
 import { upsertCurrentView } from '../db/client';
+import { parseDirtyKey } from './enrich';
 
 interface BestOffer {
   offer_id: string;
@@ -2336,7 +2374,7 @@ export async function recomputeScoresForDirty(env: Env, dirty: Set<string>): Pro
   }
 
   for (const key of dirty) {
-    const [asin, condition] = key.split('__') as [string, GpuCondition];
+    const { asin, condition } = parseDirtyKey(key);
     const product = await env.DB.prepare('SELECT category_id, model FROM products WHERE asin = ?').bind(asin).first<{ category_id: string; model: string | null }>();
     if (!product) continue;
 
@@ -2477,17 +2515,16 @@ describe('runCron', () => {
     expect(newProd.last_refreshed).toBe(0);
   });
 
-  it('skips enrich + discover when tokens < 30', async () => {
+  it('skips enrich + discover when tokens < 30 (asserts only ONE fetch call)', async () => {
     await env.DB.prepare(
       `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '["rtx 5090"]', '{"5090":1999}', 1)`
     ).run();
-    stubKeepaSequence([
+    const fetchFn = stubKeepaSequence([
       json({ tokensLeft: 5, refillIn: 60000, refillRate: 1, timestamp: Date.now() }),
     ]);
     await runCron(env);
-    // No /product or /search calls were issued — only the /token call was made
-    // (verified by the absence of further mock call count; vi.fn().mock.calls.length === 1)
-    // Cleaner assertion: no products inserted from discovery, no offers from enrichment.
+    // The strong assertion: only the /token call fires, nothing else.
+    expect(fetchFn).toHaveBeenCalledTimes(1);
     const offers = await env.DB.prepare('SELECT COUNT(*) AS n FROM offers').first<any>();
     expect(offers.n).toBe(0);
   });
@@ -2526,6 +2563,10 @@ const TOKENS_PER_ASIN = 2;            // /product?stats=180
  *   3. Discover — top up new ASINs from /search
  *   4. Score — recompute current_view for dirty rows
  *   5. (Alert eval — added in Chunk 4)
+ *
+ * Budget is computed once from the initial /token call. We do NOT re-poll
+ * tokens between enrich and discover — that would waste a Worker→Keepa
+ * round-trip every tick AND breaks deterministic mocking in tests.
  */
 export async function runCron(env: Env): Promise<void> {
   const tokensRemaining = await fetchTokens(env);
@@ -2536,17 +2577,22 @@ export async function runCron(env: Env): Promise<void> {
 
   const dirty: DirtySet = new Set();
 
-  // Phase 2: enrich
+  // Phase 2: enrich. Budget = tokensRemaining minus SEARCH_RESERVE for discover.
   const enrichBudget = Math.max(0, Math.floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / TOKENS_PER_ASIN));
+  let asinsEnriched = 0;
   if (enrichBudget > 0) {
     const stale = await getStaleProductAsins(env.DB, Date.now(), STALE_MS, enrichBudget);
-    if (stale.length > 0) await enrichBatch(env, stale, dirty);
+    if (stale.length > 0) {
+      await enrichBatch(env, stale, dirty);
+      asinsEnriched = stale.length;
+    }
   }
 
-  // Phase 3: discover (rotate one category per tick — Phase 1 only has 'gpu')
-  // We always run discovery if budget allows; discoverForCategory bails internally on bot-wall.
-  const tokensAfterEnrich = await fetchTokens(env);
-  if (tokensAfterEnrich >= SEARCH_RESERVE) {
+  // Phase 3: discover. Compute remaining budget from arithmetic (no extra /token call).
+  // After enrich consumed ~asinsEnriched*2 tokens, we have ~tokensRemaining - that left.
+  const tokensAfterEnrichEstimate = tokensRemaining - asinsEnriched * TOKENS_PER_ASIN;
+  if (tokensAfterEnrichEstimate >= SEARCH_RESERVE) {
+    // discoverForCategory bails internally on bot-wall and returns 0
     await discoverForCategory(env, 'gpu', dirty);
   }
 
@@ -2620,7 +2666,7 @@ Composes the four pipeline phases. Adaptive enrich budget per spec §4.1:
 floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / 2). Recovery
 sweep + alert eval added in Chunk 4.
 
-Manual smoke: wrangler dev --test-scheduled then curl /__scheduled?cron=*/10*
+Manual smoke: wrangler dev --test-scheduled then curl '/__scheduled?cron=*/10+*+*+*+*'
 
 — claude-opus-4-7"
 ```
