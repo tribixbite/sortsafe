@@ -3549,3 +3549,1361 @@ git commit -m "feat(cron): wire phase 0 (recovery) and phase 5 (alert eval) into
 Next chunk (5): public read API (`/v1/offers`, `/v1/products`), admin import endpoint, CORS proxy.
 
 ---
+
+## Chunk 5: Public read API + admin import + CORS proxy
+
+This chunk exposes the cron-built `current_view` data over HTTP so the SPA can hydrate from `/v1/offers`. Adds an admin-only `/v1/admin/import` for the one-time backfill from `static/gpus-seed.json`. Adds `/proxy/amazon` for the Phase 3 browser scraper (Phase 1 only needs the endpoint to exist + be HMAC-protected; the scraper itself comes later).
+
+### Task 17: Hono router + read endpoints (`/v1/offers`, `/v1/products`, `/v1/categories`, `/v1/config/discord-invite`)
+
+**Files:**
+- Create: `worker/src/router.ts`
+- Create: `worker/src/api/offers.ts`
+- Create: `worker/src/api/products.ts`
+- Create: `worker/src/api/config.ts`
+- Create: `worker/test/api/offers.test.ts`
+- Modify: `worker/src/index.ts:5-13` — replace inline fetch with router
+
+- [ ] **Step 1: Write the failing test** at `worker/test/api/offers.test.ts`
+
+```typescript
+import { describe, it, expect, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { fetchOffersRoute } from '../../src/api/offers';
+
+const seed = async () => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '[]', '{"5090":1999}', 1)`
+  ).run();
+  for (const [asin, model, title] of [['B0OFR01', '5090', 'Test 5090 A'], ['B0OFR02', '4090', 'Test 4090 B'], ['B0OFR03', '5090', 'Test 5090 C']]) {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+       VALUES (?, 'gpu', ?, ?, 'X', null, '{}', 1000, 1000, 1)`
+    ).bind(asin, model, title).run();
+  }
+  // current_view rows with composite scores 90 / 70 / 50 so we can verify sort
+  for (const [asin, condition, price, score] of [['B0OFR01', 'used-good', 1500, 90], ['B0OFR02', 'used-good', 2800, 70], ['B0OFR03', 'refurbished', 1700, 50]]) {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO offers (offer_id, asin, condition, price_usd, source, first_seen, last_seen, available)
+       VALUES (?, ?, ?, ?, 'keepa', 1000, ?, 1)`
+    ).bind(`${asin}__${condition}__`, asin, condition, price, Date.now()).run();
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO current_view (asin, condition, current_price_usd, best_offer_id, composite_score, recomputed_at)
+       VALUES (?, ?, ?, ?, ?, ?)`
+    ).bind(asin, condition, price, `${asin}__${condition}__`, score, Date.now()).run();
+  }
+};
+
+describe('GET /v1/offers', () => {
+  beforeEach(async () => {
+    await env.DB.prepare('DELETE FROM current_view').run();
+    await env.DB.prepare('DELETE FROM offers').run();
+    await env.DB.prepare('DELETE FROM products').run();
+  });
+
+  it('returns all current offers for cat=gpu sorted by composite_score DESC', async () => {
+    await seed();
+    const res = await fetchOffersRoute(env, new Request('http://x/v1/offers?cat=gpu'));
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.offers.map((o: any) => o.asin)).toEqual(['B0OFR01', 'B0OFR02', 'B0OFR03']);
+    expect(body.offers[0].composite_score).toBe(90);
+    expect(body.offers[0].title).toBe('Test 5090 A');
+  });
+
+  it('filters by model when ?model=5090', async () => {
+    await seed();
+    const res = await fetchOffersRoute(env, new Request('http://x/v1/offers?cat=gpu&model=5090'));
+    const body = await res.json() as any;
+    expect(body.offers.map((o: any) => o.asin).sort()).toEqual(['B0OFR01', 'B0OFR03']);
+  });
+
+  it('filters by condition when ?condition=refurbished', async () => {
+    await seed();
+    const res = await fetchOffersRoute(env, new Request('http://x/v1/offers?cat=gpu&condition=refurbished'));
+    const body = await res.json() as any;
+    expect(body.offers.map((o: any) => o.asin)).toEqual(['B0OFR03']);
+  });
+
+  it('omits offers older than fresh_s seconds when ?fresh=900', async () => {
+    await seed();
+    // Bump B0OFR02's recomputed_at into the past
+    await env.DB.prepare(`UPDATE current_view SET recomputed_at = ? WHERE asin = 'B0OFR02'`).bind(Date.now() - 30 * 60 * 1000).run();
+    const res = await fetchOffersRoute(env, new Request('http://x/v1/offers?cat=gpu&fresh=900'));
+    const body = await res.json() as any;
+    expect(body.offers.map((o: any) => o.asin)).not.toContain('B0OFR02');
+  });
+
+  it('returns 400 when cat is missing or unknown', async () => {
+    expect((await fetchOffersRoute(env, new Request('http://x/v1/offers'))).status).toBe(400);
+    expect((await fetchOffersRoute(env, new Request('http://x/v1/offers?cat=unknown'))).status).toBe(400);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test api/offers
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/api/offers.ts`**
+
+```typescript
+import type { Env } from '../env';
+import type { GpuCondition } from '../db/types';
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=60' },
+});
+
+interface OfferOut {
+  offer_id: string;
+  asin: string;
+  title: string;
+  thumbnail_url: string | null;
+  model: string | null;
+  condition: GpuCondition;
+  current_price_usd: number;
+  median_30d: number | null;
+  median_90d: number | null;
+  msrp_baseline: number | null;
+  pct_below_median_30d: number | null;
+  pct_below_median_90d: number | null;
+  pct_off_msrp: number | null;
+  composite_score: number;
+  is_lowest_30d: boolean;
+  is_lowest_90d: boolean;
+  recomputed_at: number;
+  seller: string | null;
+  seller_id: string | null;
+  seller_rating: number | null;
+}
+
+const VALID_CATEGORIES = new Set(['gpu', 'ram', 'ssd']);
+
+export async function fetchOffersRoute(env: Env, req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const cat = url.searchParams.get('cat');
+  if (!cat || !VALID_CATEGORIES.has(cat)) {
+    return json({ error: 'cat query param required (gpu|ram|ssd)' }, 400);
+  }
+  const model = url.searchParams.get('model');
+  const condition = url.searchParams.get('condition');
+  const freshS = parseInt(url.searchParams.get('fresh') ?? '0', 10);
+
+  const filters: string[] = ['p.category_id = ?'];
+  const binds: unknown[] = [cat];
+  if (model) { filters.push('p.model = ?'); binds.push(model); }
+  if (condition) { filters.push('cv.condition = ?'); binds.push(condition); }
+  if (freshS > 0) { filters.push('cv.recomputed_at >= ?'); binds.push(Date.now() - freshS * 1000); }
+
+  const r = await env.DB.prepare(
+    `SELECT cv.asin, cv.condition, cv.current_price_usd, cv.best_offer_id,
+            cv.median_30d, cv.median_90d, cv.msrp_baseline,
+            cv.pct_below_median_30d, cv.pct_below_median_90d, cv.pct_off_msrp,
+            cv.composite_score, cv.is_lowest_30d, cv.is_lowest_90d, cv.recomputed_at,
+            p.title, p.thumbnail_url, p.model,
+            o.seller, o.seller_id, o.seller_rating
+     FROM current_view cv
+     JOIN products p ON p.asin = cv.asin
+     JOIN offers   o ON o.offer_id = cv.best_offer_id
+     WHERE ${filters.join(' AND ')}
+     ORDER BY cv.composite_score DESC
+     LIMIT 500`
+  ).bind(...binds).all<any>();
+
+  const offers: OfferOut[] = r.results.map((row: any) => ({
+    offer_id: row.best_offer_id, asin: row.asin, title: row.title, thumbnail_url: row.thumbnail_url,
+    model: row.model, condition: row.condition,
+    current_price_usd: row.current_price_usd,
+    median_30d: row.median_30d, median_90d: row.median_90d, msrp_baseline: row.msrp_baseline,
+    pct_below_median_30d: row.pct_below_median_30d, pct_below_median_90d: row.pct_below_median_90d, pct_off_msrp: row.pct_off_msrp,
+    composite_score: row.composite_score,
+    is_lowest_30d: !!row.is_lowest_30d, is_lowest_90d: !!row.is_lowest_90d,
+    recomputed_at: row.recomputed_at,
+    seller: row.seller, seller_id: row.seller_id, seller_rating: row.seller_rating,
+  }));
+
+  return json({ offers, generated_at: Date.now() });
+}
+```
+
+- [ ] **Step 4: Implement `worker/src/api/products.ts`** (small — reads from products table)
+
+```typescript
+import type { Env } from '../env';
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=300' },
+});
+
+export async function listProductsRoute(env: Env, req: Request): Promise<Response> {
+  const url = new URL(req.url);
+  const cat = url.searchParams.get('cat');
+  if (!cat) return json({ error: 'cat required' }, 400);
+  const r = await env.DB.prepare(
+    `SELECT asin, category_id, model, title, brand, thumbnail_url, attrs_json, last_refreshed
+     FROM products WHERE category_id = ? AND active = 1 ORDER BY last_refreshed DESC LIMIT 1000`
+  ).bind(cat).all<any>();
+  return json({ products: r.results });
+}
+
+export async function getProductRoute(env: Env, asin: string): Promise<Response> {
+  const r = await env.DB.prepare(
+    `SELECT asin, category_id, model, title, brand, thumbnail_url, attrs_json, last_refreshed
+     FROM products WHERE asin = ?`
+  ).bind(asin).first<any>();
+  if (!r) return json({ error: 'not found' }, 404);
+  return json(r);
+}
+```
+
+- [ ] **Step 5: Implement `worker/src/api/config.ts`**
+
+```typescript
+import type { Env } from '../env';
+
+export function discordInviteRoute(env: Env): Response {
+  const url = env.DISCORD_INVITE_URL ?? null;
+  return new Response(JSON.stringify({ invite_url: url }), {
+    headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=3600' },
+  });
+}
+```
+
+- [ ] **Step 6: Wire `worker/src/router.ts`**
+
+```typescript
+import type { Env } from './env';
+import { fetchOffersRoute } from './api/offers';
+import { listProductsRoute, getProductRoute } from './api/products';
+import { discordInviteRoute } from './api/config';
+import { proxyAmazon } from './proxy/amazon';
+import { adminImportRoute } from './api/admin';
+
+const cors = (res: Response) => {
+  const h = new Headers(res.headers);
+  h.set('access-control-allow-origin', '*');
+  h.set('access-control-allow-methods', 'GET,POST,OPTIONS');
+  h.set('access-control-allow-headers', 'content-type, authorization, x-sortsafe-hmac');
+  return new Response(res.body, { status: res.status, headers: h });
+}
+
+export async function route(req: Request, env: Env): Promise<Response> {
+  if (req.method === 'OPTIONS') return cors(new Response(null, { status: 204 }));
+  const url = new URL(req.url);
+  const path = url.pathname;
+
+  if (path === '/healthz') return cors(new Response(JSON.stringify({ ok: true, ts: Date.now() }), { headers: { 'content-type': 'application/json' } }));
+  if (path === '/v1/offers') return cors(await fetchOffersRoute(env, req));
+  if (path === '/v1/products') return cors(await listProductsRoute(env, req));
+  if (path.startsWith('/v1/products/')) {
+    const asin = path.slice('/v1/products/'.length);
+    return cors(await getProductRoute(env, asin));
+  }
+  if (path === '/v1/config/discord-invite') return cors(discordInviteRoute(env));
+  if (path === '/v1/admin/import') return cors(await adminImportRoute(env, req));
+  if (path === '/proxy/amazon') return cors(await proxyAmazon(env, req));
+  return cors(new Response('not found', { status: 404 }));
+}
+```
+
+- [ ] **Step 7: Update `worker/src/index.ts`** to delegate to router
+
+```typescript
+import type { Env, AlertMessage } from './env';
+import { runCron } from './pipeline/cron';
+import { handleAlertBatch } from './queue/consumer';
+import { route } from './router';
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> { return route(req, env); },
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (event.cron === '*/10 * * * *') ctx.waitUntil(runCron(env).catch((e) => console.error('[cron]', e)));
+  },
+  async queue(batch: MessageBatch<AlertMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+    await handleAlertBatch(env, batch);
+  },
+};
+```
+
+- [ ] **Step 8: Run tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test api/offers
+```
+
+Expected: 5/5 PASS.
+
+- [ ] **Step 9: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/api/ worker/src/router.ts worker/src/index.ts worker/test/api/
+git commit -m "feat(api): /v1/offers + /v1/products + /v1/config/discord-invite read endpoints with Hono-style router
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 18: Admin import endpoint (HMAC-guarded backfill from gpus-seed.json)
+
+**Files:**
+- Create: `worker/src/lib/hmac.ts`
+- Create: `worker/src/api/admin.ts`
+- Create: `worker/test/api/admin.test.ts`
+
+- [ ] **Step 1: Implement `worker/src/lib/hmac.ts`**
+
+```typescript
+/**
+ * Constant-time HMAC verification for /v1/admin/* and /v1/scrape-tasks/*.
+ * Caller passes the raw header value (e.g. "x-sortsafe-hmac: <hex>") and the
+ * canonical body string we signed. Returns true iff the signatures match.
+ */
+async function hmacSha256Hex(key: string, message: string): Promise<string> {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(key), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const constantTimeEqual = (a: string, b: string): boolean => {
+  if (a.length !== b.length) return false;
+  let acc = 0;
+  for (let i = 0; i < a.length; i++) acc |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return acc === 0;
+};
+
+export async function verifyHmac(secret: string, providedHex: string, message: string): Promise<boolean> {
+  const expected = await hmacSha256Hex(secret, message);
+  return constantTimeEqual(providedHex, expected);
+}
+```
+
+- [ ] **Step 2: Write the failing test** at `worker/test/api/admin.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { adminImportRoute } from '../../src/api/admin';
+
+const seedHash = async (secret: string, body: string): Promise<string> => {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(body));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+const samplePayload = JSON.stringify({
+  generated_at: 1777300000000,
+  products: [
+    { asin: 'B0IMP01', model: '5090', title: 'GIGABYTE GeForce RTX 5090 32G', thumbnail_url: 'https://example.com/t.jpg', last_refreshed: 1777300000000 },
+  ],
+  offers: [
+    { offer_id: 'B0IMP01__used-good__', asin: 'B0IMP01', model: '5090', title: 'GIGABYTE GeForce RTX 5090 32G',
+      condition: 'used-good', condition_note: null, price_usd: 1500, currency: 'USD',
+      seller: null, seller_id: null, seller_rating: null, seller_rating_count: null,
+      ships_from: null, delivery_text: null, first_seen: 1777300000000, last_seen: 1777300000000, is_buybox: false },
+  ],
+});
+
+describe('POST /v1/admin/import', () => {
+  it('rejects requests without HMAC header (401)', async () => {
+    const res = await adminImportRoute(env, new Request('http://x/v1/admin/import', { method: 'POST', body: samplePayload }));
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects requests with wrong HMAC (401)', async () => {
+    const res = await adminImportRoute(env, new Request('http://x/v1/admin/import', {
+      method: 'POST', body: samplePayload, headers: { 'x-sortsafe-hmac': 'wrong'.repeat(20) },
+    }));
+    expect(res.status).toBe(401);
+  });
+
+  it('imports products and offers when HMAC verifies', async () => {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '[]', '{"5090":1999}', 1)`
+    ).run();
+    const sig = await seedHash(env.SCRAPE_HMAC, samplePayload);
+    const res = await adminImportRoute(env, new Request('http://x/v1/admin/import', {
+      method: 'POST', body: samplePayload, headers: { 'x-sortsafe-hmac': sig },
+    }));
+    expect(res.status).toBe(200);
+    const body = await res.json() as any;
+    expect(body.products_imported).toBe(1);
+    expect(body.offers_imported).toBe(1);
+
+    const product = await env.DB.prepare('SELECT title FROM products WHERE asin = ?').bind('B0IMP01').first<any>();
+    expect(product.title).toBe('GIGABYTE GeForce RTX 5090 32G');
+    const offer = await env.DB.prepare('SELECT source FROM offers WHERE offer_id = ?').bind('B0IMP01__used-good__').first<any>();
+    expect(offer.source).toBe('admin-import');
+  });
+});
+```
+
+- [ ] **Step 3: Implement `worker/src/api/admin.ts`**
+
+```typescript
+import type { Env } from '../env';
+import type { GpuCondition, OfferSource } from '../db/types';
+import { verifyHmac } from '../lib/hmac';
+import { upsertProduct, upsertOffer } from '../db/client';
+
+interface SeedProduct {
+  asin: string;
+  model: string;
+  title: string;
+  thumbnail_url: string | null;
+  last_refreshed: number;
+}
+
+interface SeedOffer {
+  offer_id: string;
+  asin: string;
+  model: string;
+  title: string;
+  condition: GpuCondition;
+  condition_note: string | null;
+  price_usd: number;
+  seller: string | null;
+  seller_id: string | null;
+  seller_rating: number | null;
+  seller_rating_count: number | null;
+  ships_from: string | null;
+  first_seen: number;
+  last_seen: number;
+}
+
+interface SeedFile {
+  generated_at: number;
+  products: SeedProduct[];
+  offers: SeedOffer[];
+}
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { 'content-type': 'application/json' },
+});
+
+export async function adminImportRoute(env: Env, req: Request): Promise<Response> {
+  if (req.method !== 'POST') return json({ error: 'POST only' }, 405);
+  const provided = req.headers.get('x-sortsafe-hmac');
+  if (!provided) return json({ error: 'missing x-sortsafe-hmac header' }, 401);
+  const body = await req.text();
+  const ok = await verifyHmac(env.SCRAPE_HMAC, provided, body);
+  if (!ok) return json({ error: 'bad signature' }, 401);
+
+  let seed: SeedFile;
+  try { seed = JSON.parse(body) as SeedFile; }
+  catch { return json({ error: 'invalid JSON' }, 400); }
+
+  const now = Date.now();
+  let productsImported = 0;
+  let offersImported = 0;
+
+  for (const p of seed.products ?? []) {
+    await upsertProduct(env.DB, {
+      asin: p.asin, category_id: 'gpu', model: p.model,
+      title: p.title, brand: null, thumbnail_url: p.thumbnail_url,
+      attrs_json: '{}',
+      first_seen: p.last_refreshed, last_refreshed: p.last_refreshed, active: 1,
+    });
+    productsImported++;
+  }
+  for (const o of seed.offers ?? []) {
+    await upsertOffer(env.DB, {
+      offer_id: o.offer_id, asin: o.asin, condition: o.condition,
+      price_usd: o.price_usd,
+      seller: o.seller, seller_id: o.seller_id,
+      seller_rating: o.seller_rating, seller_rating_count: o.seller_rating_count,
+      ships_from: o.ships_from,
+      source: 'admin-import' as OfferSource,
+      first_seen: o.first_seen, last_seen: o.last_seen, available: 1,
+    });
+    offersImported++;
+  }
+
+  return json({ products_imported: productsImported, offers_imported: offersImported, generated_at: seed.generated_at });
+}
+```
+
+- [ ] **Step 4: Run tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test api/admin
+```
+
+Expected: 3/3 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/lib/hmac.ts worker/src/api/admin.ts worker/test/api/admin.test.ts
+git commit -m "feat(api): /v1/admin/import — HMAC-guarded backfill of products + offers from gpus-seed.json shape
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 19: CORS proxy for Amazon (Phase 1: HMAC + host allowlist + per-IP rate limit; scraper logic in Phase 3)
+
+**Files:**
+- Create: `worker/src/proxy/amazon.ts`
+- Create: `worker/src/lib/rate-limit.ts`
+- Create: `worker/test/proxy/amazon.test.ts`
+
+- [ ] **Step 1: Implement `worker/src/lib/rate-limit.ts`**
+
+```typescript
+/**
+ * Naive KV-backed per-key rate limiter. Bucket = floor(now / window_ms).
+ * Returns true when allowed; increments the counter as a side effect.
+ *
+ * Cost: 1 KV read + 1 KV write per call. Acceptable at ~30 req/min/IP scale.
+ */
+export async function checkRateLimit(kv: KVNamespace, key: string, limit: number, windowMs: number): Promise<boolean> {
+  const bucket = Math.floor(Date.now() / windowMs);
+  const k = `rl:${key}:${bucket}`;
+  const current = parseInt((await kv.get(k)) ?? '0', 10);
+  if (current >= limit) return false;
+  // TTL = windowMs in seconds + a small grace
+  await kv.put(k, String(current + 1), { expirationTtl: Math.max(60, Math.ceil(windowMs / 1000) + 10) });
+  return true;
+}
+```
+
+- [ ] **Step 2: Write the failing test** at `worker/test/proxy/amazon.test.ts`
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { proxyAmazon } from '../../src/proxy/amazon';
+
+const seedHash = async (secret: string, message: string): Promise<string> => {
+  const k = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', k, new TextEncoder().encode(message));
+  return [...new Uint8Array(sig)].map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+const reqWithHmac = async (target: string) => {
+  const sig = await seedHash(env.SCRAPE_HMAC, target);
+  return new Request(`http://x/proxy/amazon?u=${encodeURIComponent(target)}`, {
+    headers: { 'x-sortsafe-hmac': sig, 'cf-connecting-ip': '203.0.113.1' },
+  });
+};
+
+describe('GET /proxy/amazon', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('rejects without HMAC (401)', async () => {
+    const res = await proxyAmazon(env, new Request('http://x/proxy/amazon?u=https%3A%2F%2Fwww.amazon.com%2Fdp%2FB0DT7GMXHB'));
+    expect(res.status).toBe(401);
+  });
+
+  it('rejects non-amazon hosts (400)', async () => {
+    const target = 'https://example.com/foo';
+    const sig = await seedHash(env.SCRAPE_HMAC, target);
+    const res = await proxyAmazon(env, new Request(`http://x/proxy/amazon?u=${encodeURIComponent(target)}`, {
+      headers: { 'x-sortsafe-hmac': sig, 'cf-connecting-ip': '203.0.113.2' },
+    }));
+    expect(res.status).toBe(400);
+  });
+
+  it('proxies a valid amazon URL through fetch', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('<html>real PDP body padded</html>', { status: 200 })));
+    const res = await proxyAmazon(env, await reqWithHmac('https://www.amazon.com/dp/B0DT7GMXHB'));
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body).toContain('real PDP body');
+  });
+
+  it('returns 429 when per-IP rate limit exceeded', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('ok', { status: 200 })));
+    // Burn through the limit (30/min)
+    for (let i = 0; i < 30; i++) {
+      await proxyAmazon(env, await reqWithHmac('https://www.amazon.com/dp/B0DT7GMXHB'));
+    }
+    const res = await proxyAmazon(env, await reqWithHmac('https://www.amazon.com/dp/B0DT7GMXHB'));
+    expect(res.status).toBe(429);
+  });
+});
+```
+
+- [ ] **Step 3: Implement `worker/src/proxy/amazon.ts`**
+
+```typescript
+import type { Env } from '../env';
+import { verifyHmac } from '../lib/hmac';
+import { checkRateLimit } from '../lib/rate-limit';
+import { detectBotWall } from '../keepa/bot-wall';
+
+const HOST_ALLOWLIST = new Set([
+  'www.amazon.com', 'amazon.com', 'm.amazon.com',
+  'm.media-amazon.com', 'images-na.ssl-images-amazon.com',
+]);
+const RATE_LIMIT = 30;
+const RATE_WINDOW_MS = 60_000;
+const BROWSER_UA = 'Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+
+const json = (body: unknown, status = 200) => new Response(JSON.stringify(body), {
+  status, headers: { 'content-type': 'application/json' },
+});
+
+export async function proxyAmazon(env: Env, req: Request): Promise<Response> {
+  // HMAC: signed message is the raw target URL string
+  const url = new URL(req.url);
+  const target = url.searchParams.get('u');
+  if (!target) return json({ error: 'u query param required' }, 400);
+
+  const provided = req.headers.get('x-sortsafe-hmac');
+  if (!provided) return json({ error: 'missing x-sortsafe-hmac' }, 401);
+  if (!(await verifyHmac(env.SCRAPE_HMAC, provided, target))) return json({ error: 'bad signature' }, 401);
+
+  // Host allowlist
+  let parsed: URL;
+  try { parsed = new URL(target); } catch { return json({ error: 'invalid u' }, 400); }
+  if (!HOST_ALLOWLIST.has(parsed.hostname)) return json({ error: `host not allowed: ${parsed.hostname}` }, 400);
+
+  // Per-IP rate limit
+  const ip = req.headers.get('cf-connecting-ip') ?? '0.0.0.0';
+  if (!(await checkRateLimit(env.CACHE, `proxy:${ip}`, RATE_LIMIT, RATE_WINDOW_MS))) {
+    return json({ error: 'rate limited' }, 429);
+  }
+
+  // Forward
+  const upstream = await fetch(target, {
+    headers: {
+      'user-agent': BROWSER_UA,
+      'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+      'accept-language': 'en-US,en;q=0.9',
+      'cache-control': 'no-cache',
+    },
+    redirect: 'follow',
+  });
+  const body = await upstream.text();
+
+  // Tag bot-wall responses so the caller knows not to parse them as content
+  const reason = detectBotWall(body);
+  return new Response(body, {
+    status: upstream.status,
+    headers: {
+      'content-type': upstream.headers.get('content-type') ?? 'text/html; charset=utf-8',
+      'x-sortsafe-bot-wall': reason,
+    },
+  });
+}
+```
+
+- [ ] **Step 4: Run tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test proxy/amazon
+```
+
+Expected: 4/4 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/proxy/ worker/src/lib/rate-limit.ts worker/test/proxy/
+git commit -m "feat(proxy): /proxy/amazon — HMAC + host allowlist + per-IP rate limit + bot-wall tagging
+
+— claude-opus-4-7"
+```
+
+---
+
+**End of Chunk 5.** At this point:
+- `cd ~/git/sortsafe/worker && bun test` passes ~85 cases.
+- Public read API (`/v1/offers`, `/v1/products`, `/v1/config/discord-invite`) returns cron-scored data over HTTP with edge cache headers.
+- Admin import endpoint accepts the existing `static/gpus-seed.json` shape and writes via the same upserts the cron uses.
+- CORS proxy is in place — locked behind HMAC + host allowlist + 30 req/min/IP. Phase 3 SPA scraper will use it; Phase 1 only needs it to exist + be testable.
+
+Next chunk (6): daily maintenance cron, R2 backup, observability bindings.
+
+---
+
+## Chunk 6: Daily cron (snapshot TTL + R2 backup) + observability
+
+This chunk handles the 03:00 UTC daily cron from spec §4.1.1: prune snapshots older than 90 days, prune delivered alert rows, dump D1 to R2 as NDJSON. Also wires Workers Analytics Engine events at every parse boundary, alert dispatch, and bot-wall detection so we can debug from the CF dashboard without log-grep.
+
+### Task 20: Daily maintenance cron
+
+**Files:**
+- Create: `worker/src/pipeline/cron-daily.ts`
+- Create: `worker/src/pipeline/backup.ts`
+- Create: `worker/test/pipeline/cron-daily.test.ts`
+- Create: `worker/test/pipeline/backup.test.ts`
+- Modify: `worker/src/index.ts` — wire 03:00 cron
+
+- [ ] **Step 1: Implement `worker/src/pipeline/backup.ts`**
+
+```typescript
+import type { Env } from '../env';
+
+const TABLES = [
+  'users', 'pin_lookups', 'push_subs',
+  'categories', 'products', 'offers', 'snapshots',
+  'keepa_token_log', 'current_view',
+  'alert_rules', 'alert_deliveries', 'discord_config',
+  'watchers', 'scrape_tasks',
+];
+
+/**
+ * Dump every table to NDJSON, gzip, upload to R2 with a date-stamped key.
+ * Output format: each table separated by `---table:<name>---\n`, then one
+ * JSON object per row, then a blank line. Restore script reverses this.
+ *
+ * For Phase 1 (~50 products, ~few thousand snapshots) the whole dump fits
+ * in <1MB; we send it as a single PUT. If the snapshots table grows past
+ * ~50K rows in Phase 3, switch to per-table multipart upload.
+ */
+export async function backupToR2(env: Env, dateKey: string): Promise<{ size_bytes: number; tables: number }> {
+  const chunks: string[] = [];
+  for (const t of TABLES) {
+    const rows = await env.DB.prepare(`SELECT * FROM ${t}`).all<Record<string, unknown>>();
+    chunks.push(`---table:${t}---`);
+    for (const r of rows.results) chunks.push(JSON.stringify(r));
+    chunks.push('');     // blank line between tables for readability
+  }
+  const ndjson = chunks.join('\n');
+  // GZip via CompressionStream (Workers runtime exposes it)
+  const compressed = await new Response(
+    new Blob([ndjson]).stream().pipeThrough(new CompressionStream('gzip'))
+  ).arrayBuffer();
+  await env.BACKUPS.put(`d1/${dateKey}.ndjson.gz`, compressed, {
+    httpMetadata: { contentType: 'application/x-ndjson', contentEncoding: 'gzip' },
+  });
+  return { size_bytes: compressed.byteLength, tables: TABLES.length };
+}
+```
+
+- [ ] **Step 2: Write the failing test for backup** at `worker/test/pipeline/backup.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { backupToR2 } from '../../src/pipeline/backup';
+
+describe('backupToR2', () => {
+  it('uploads a gzipped NDJSON of all tables to the dated R2 key', async () => {
+    await env.DB.prepare(`INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu','GPUs','[]','{"5090":1999}',1)`).run();
+    const r = await backupToR2(env, '2026-05-04');
+    expect(r.tables).toBeGreaterThan(10);
+    expect(r.size_bytes).toBeGreaterThan(20);
+    const obj = await env.BACKUPS.get('d1/2026-05-04.ndjson.gz');
+    expect(obj).not.toBeNull();
+    // Decompress and check the categories table is in there
+    const decompressed = await new Response(obj!.body!.pipeThrough(new DecompressionStream('gzip'))).text();
+    expect(decompressed).toContain('---table:categories---');
+    expect(decompressed).toContain('"category_id":"gpu"');
+  });
+
+  it('overwrites the same key on second run (idempotent date)', async () => {
+    await backupToR2(env, '2026-05-04');
+    const r2 = await backupToR2(env, '2026-05-04');
+    expect(r2.tables).toBeGreaterThan(0);
+    const list = await env.BACKUPS.list({ prefix: 'd1/' });
+    const matching = list.objects.filter((o) => o.key === 'd1/2026-05-04.ndjson.gz');
+    expect(matching.length).toBe(1);
+  });
+});
+```
+
+- [ ] **Step 3: Implement `worker/src/pipeline/cron-daily.ts`** per spec §4.1.1
+
+```typescript
+import type { Env } from '../env';
+import { backupToR2 } from './backup';
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const SNAPSHOT_TTL_DAYS = 90;
+const DELIVERY_TTL_DAYS = 30;
+const PIN_LOOKUP_TTL_HOURS = 24;
+const SCRAPE_TASK_TTL_DAYS = 7;
+const BACKUP_RETENTION_DAYS = 7;
+
+export async function runDailyCron(env: Env): Promise<void> {
+  const now = Date.now();
+  const dateKey = new Date(now).toISOString().slice(0, 10);
+
+  // Step 1: prune snapshots
+  const snapCutoff = now - SNAPSHOT_TTL_DAYS * DAY_MS;
+  const snapDeleted = await env.DB.prepare(`DELETE FROM snapshots WHERE taken_at < ?`).bind(snapCutoff).run();
+
+  // Step 2: prune delivered alert rows
+  const delvCutoff = now - DELIVERY_TTL_DAYS * DAY_MS;
+  const delvDeleted = await env.DB.prepare(`DELETE FROM alert_deliveries WHERE delivered_at IS NOT NULL AND delivered_at < ?`).bind(delvCutoff).run();
+
+  // Step 3: prune pin_lookups (>24h old)
+  const pinCutoff = Math.floor((now - PIN_LOOKUP_TTL_HOURS * 60 * 60 * 1000) / 3_600_000);
+  const pinDeleted = await env.DB.prepare(`DELETE FROM pin_lookups WHERE hour_bucket < ?`).bind(pinCutoff).run();
+
+  // Step 4: prune completed scrape_tasks
+  const taskCutoff = now - SCRAPE_TASK_TTL_DAYS * DAY_MS;
+  const taskDeleted = await env.DB.prepare(`DELETE FROM scrape_tasks WHERE completed_at IS NOT NULL AND completed_at < ?`).bind(taskCutoff).run();
+
+  // Step 5: R2 backup
+  const backup = await backupToR2(env, dateKey);
+
+  // Step 6: prune old backups
+  const list = await env.BACKUPS.list({ prefix: 'd1/' });
+  const backupCutoff = now - BACKUP_RETENTION_DAYS * DAY_MS;
+  for (const o of list.objects) {
+    if (o.uploaded.getTime() < backupCutoff) {
+      await env.BACKUPS.delete(o.key);
+    }
+  }
+
+  console.log(`[cron-daily] snapshots:${snapDeleted.meta.changes} deliveries:${delvDeleted.meta.changes} pin_lookups:${pinDeleted.meta.changes} tasks:${taskDeleted.meta.changes} backup:${backup.size_bytes}b`);
+}
+```
+
+- [ ] **Step 4: Write the failing test for daily cron**
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { runDailyCron } from '../../src/pipeline/cron-daily';
+
+describe('runDailyCron', () => {
+  it('prunes snapshots older than 90 days', async () => {
+    await env.DB.prepare(`INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu','GPUs','[]','{"5090":1999}',1)`).run();
+    await env.DB.prepare(`INSERT OR IGNORE INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active) VALUES ('B0DAY01','gpu','5090','t','x',null,'{}',1,1,1)`).run();
+    const now = Date.now();
+    await env.DB.prepare(`INSERT INTO snapshots (asin, condition, price_usd, taken_at, source) VALUES ('B0DAY01','used-good',1500,?,'keepa')`).bind(now - 91 * 24 * 60 * 60 * 1000).run();
+    await env.DB.prepare(`INSERT INTO snapshots (asin, condition, price_usd, taken_at, source) VALUES ('B0DAY01','used-good',1500,?,'keepa')`).bind(now - 30 * 24 * 60 * 60 * 1000).run();
+    await runDailyCron(env);
+    const r = await env.DB.prepare(`SELECT COUNT(*) AS n FROM snapshots WHERE asin = ?`).bind('B0DAY01').first<any>();
+    expect(r.n).toBe(1);
+  });
+});
+```
+
+- [ ] **Step 5: Wire the daily cron in `worker/src/index.ts`**
+
+```typescript
+async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  if (event.cron === '*/10 * * * *') ctx.waitUntil(runCron(env).catch((e) => console.error('[cron-10m]', e)));
+  if (event.cron === '0 3 * * *')   ctx.waitUntil(runDailyCron(env).catch((e) => console.error('[cron-daily]', e)));
+},
+```
+
+(Plus an `import { runDailyCron } from './pipeline/cron-daily';`)
+
+- [ ] **Step 6: Run tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/backup pipeline/cron-daily
+```
+
+Expected: 3/3 PASS.
+
+- [ ] **Step 7: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/cron-daily.ts worker/src/pipeline/backup.ts worker/src/index.ts worker/test/pipeline/backup.test.ts worker/test/pipeline/cron-daily.test.ts
+git commit -m "feat(cron): daily maintenance — TTL prune + R2 NDJSON backup with 7-day retention
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 21: Workers Analytics Engine — observability events
+
+**Files:**
+- Create: `worker/src/lib/analytics.ts`
+- Modify: `worker/src/keepa/client.ts` — emit token cost event
+- Modify: `worker/src/keepa/bot-wall.ts` callers — emit bot-wall event (3 sites: keepa.searchTerm via response, proxy/amazon, future browser scrape)
+- Modify: `worker/src/queue/consumer.ts` — emit alert dispatch event
+- Modify: `worker/src/pipeline/cron.ts` — emit cron run event with duration
+
+- [ ] **Step 1: Implement `worker/src/lib/analytics.ts`**
+
+```typescript
+import type { Env } from '../env';
+
+/**
+ * Workers Analytics Engine writer. AE accepts up to 25 blob fields + 25 doubles
+ * per event with a 256-byte cap on the union of all blobs. We use blobs for
+ * categorical dimensions (event_type, category, source) and doubles for
+ * counts/durations.
+ *
+ * Events are best-effort — if AE is unbound (test env), the call is a no-op.
+ */
+export const ae = {
+  tokenLog(env: Env, endpoint: string, cost: number, remaining: number) {
+    env.AE?.writeDataPoint({
+      blobs: ['keepa_token', endpoint],
+      doubles: [cost, remaining],
+      indexes: [endpoint],
+    });
+  },
+  botWallHit(env: Env, source: 'keepa' | 'proxy' | 'browser-scrape', reason: string, urlSlice: string) {
+    env.AE?.writeDataPoint({
+      blobs: ['bot_wall', source, reason, urlSlice.slice(0, 64)],
+      doubles: [1],
+      indexes: [source],
+    });
+  },
+  alertDispatch(env: Env, channel: string, outcome: 'delivered' | 'retry' | 'permanent-fail', latencyMs: number) {
+    env.AE?.writeDataPoint({
+      blobs: ['alert_dispatch', channel, outcome],
+      doubles: [latencyMs, 1],
+      indexes: [channel],
+    });
+  },
+  cronRun(env: Env, kind: '10m' | 'daily', durationMs: number, asinsEnriched: number, alertsDispatched: number) {
+    env.AE?.writeDataPoint({
+      blobs: ['cron', kind],
+      doubles: [durationMs, asinsEnriched, alertsDispatched],
+      indexes: [kind],
+    });
+  },
+};
+```
+
+- [ ] **Step 2: Wire `ae.tokenLog` in `worker/src/keepa/client.ts`**
+
+Append `import { ae } from '../lib/analytics';` at the top, then in each of `fetchTokens`, `fetchProducts`, `searchTerm`, after the `await logKeepaToken(...)` call, add:
+
+```typescript
+ae.tokenLog(env, '<endpoint>', <cost>, data.tokensLeft);
+```
+
+(For `searchTerm`'s bot-wall path, do NOT call `tokenLog` — call `botWallHit` instead.)
+
+- [ ] **Step 3: Wire `ae.botWallHit` at every parse boundary**
+
+In `worker/src/keepa/client.ts`:`searchTerm` bot-wall branch:
+```typescript
+ae.botWallHit(env, 'keepa', reason, url);
+```
+
+In `worker/src/proxy/amazon.ts`:
+```typescript
+import { ae } from '../lib/analytics';
+// ... after detectBotWall:
+if (reason !== 'ok') ae.botWallHit(env, 'proxy', reason, target);
+```
+
+(Phase 3 browser-scrape path will add `'browser-scrape'` source — leave as TODO comment for that file.)
+
+- [ ] **Step 4: Wire `ae.alertDispatch` in `worker/src/queue/consumer.ts`**
+
+Around the per-message dispatch in `handleAlertBatch`:
+
+```typescript
+import { ae } from '../lib/analytics';
+// at start of each message:
+const t0 = Date.now();
+// on success:
+ae.alertDispatch(env, row.channel, 'delivered', Date.now() - t0);
+// on retry-able failure:
+ae.alertDispatch(env, row.channel, 'retry', Date.now() - t0);
+// on permanent failure:
+ae.alertDispatch(env, row.channel, 'permanent-fail', Date.now() - t0);
+```
+
+- [ ] **Step 5: Wire `ae.cronRun` in `worker/src/pipeline/cron.ts` and `cron-daily.ts`**
+
+```typescript
+// In runCron:
+const t0 = Date.now();
+let asinsEnriched = 0;       // already tracked
+let alertsDispatched = 0;     // count enqueueIds.length across rules
+// ... at end:
+ae.cronRun(env, '10m', Date.now() - t0, asinsEnriched, alertsDispatched);
+```
+
+`alertsDispatched` requires `evaluateAndEnqueueAlerts` to return its count — adjust that signature to `Promise<number>` and propagate.
+
+- [ ] **Step 6: Run all tests + typecheck**
+
+```sh
+cd ~/git/sortsafe/worker && bun test && bun run typecheck
+```
+
+Expected: every test still passes (AE is unbound in tests so calls no-op), typecheck clean.
+
+- [ ] **Step 7: Smoke-check on deployed Worker (optional)**
+
+After deploying, watch the AE dataset in the Cloudflare dashboard:
+- `dash.cloudflare.com/?to=/:account/workers/analytics/sortsafe_events`
+- Filter by `blobs.0 = 'cron'` to see cron-run latencies
+- Filter by `blobs.0 = 'bot_wall'` to see if anything is being silently rejected
+
+- [ ] **Step 8: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/lib/analytics.ts worker/src/keepa/ worker/src/proxy/ worker/src/queue/ worker/src/pipeline/cron.ts worker/src/pipeline/cron-daily.ts
+git commit -m "feat(observability): Workers Analytics Engine events for token cost, bot wall, alert dispatch, cron run
+
+— claude-opus-4-7"
+```
+
+---
+
+**End of Chunk 6.** At this point:
+- Daily 03:00 UTC cron prunes old snapshots / deliveries / pin_lookups / scrape tasks and dumps D1 to R2 as gzipped NDJSON with 7-day retention.
+- Every Keepa call, bot-wall hit, alert dispatch, and cron run emits an AE event (queryable from the CF dashboard with no log-grep).
+- Worker is now feature-complete for Phase 1 backend.
+
+Next chunk (7): SPA migration to read from `/v1/offers`, production deployment, migration verification per spec §12.
+
+---
+
+## Chunk 7: SPA migration + production deploy + verification
+
+This chunk gets the SPA reading from the new Worker API instead of the static seed file, deploys everything to Cloudflare, runs the migration backfill, and verifies the cron is keeping the cloud copy fresh against Keepa ground truth (per spec §12).
+
+### Task 22: Add `hydrateFromApi` to the SPA
+
+**Files:**
+- Create: `src/lib/gpus/api.ts`
+- Modify: `src/lib/gpus/db.ts` — replace the body of `hydrateFromSeed` to delegate to `hydrateFromApi` when an API base is configured
+- Modify: `src/routes/gpus/+page.svelte` — read VITE_API_BASE
+- Create: `src/lib/gpus/api.test.ts`
+
+- [ ] **Step 1: Implement `src/lib/gpus/api.ts`**
+
+```typescript
+/**
+ * Browser-side fetcher for the cloud /v1/offers endpoint.
+ * Returns the same shape as the legacy static seed so hydrateFromSeed →
+ * hydrateFromApi is a drop-in: same offers/products arrays, same field
+ * names. The Worker's `pct_below_median_30d`, `composite_score`, etc. fields
+ * become available too — UI in this chunk doesn't render them yet (Phase 2).
+ */
+import type { GpuOffer, GpuProduct } from './types';
+
+export interface ApiSeed {
+  offers: GpuOffer[];
+  products: GpuProduct[];
+  generated_at: number;
+}
+
+export async function fetchFromApi(apiBase: string): Promise<ApiSeed | null> {
+  const url = `${apiBase.replace(/\/$/, '')}/v1/offers?cat=gpu`;
+  let res: Response;
+  try { res = await fetch(url, { cache: 'no-store' }); }
+  catch (e) { console.warn('[hydrateFromApi] fetch failed:', e); return null; }
+  if (!res.ok) { console.warn(`[hydrateFromApi] HTTP ${res.status}`); return null; }
+  const body = await res.json() as { offers: any[]; generated_at: number };
+  // The Worker returns combined offer+product info per row; split into the two arrays
+  // the SPA's IDB layer expects.
+  const offers: GpuOffer[] = [];
+  const productsByAsin = new Map<string, GpuProduct>();
+  for (const r of body.offers) {
+    offers.push({
+      offer_id: r.offer_id,
+      asin: r.asin,
+      model: r.model,
+      title: r.title,
+      condition: r.condition,
+      condition_note: null,
+      price_usd: r.current_price_usd,
+      currency: 'USD',
+      seller: r.seller,
+      seller_id: r.seller_id,
+      seller_rating: r.seller_rating,
+      seller_rating_count: null,
+      ships_from: null,
+      delivery_text: null,
+      first_seen: r.recomputed_at,
+      last_seen: r.recomputed_at,
+      is_buybox: r.condition === 'new',
+    });
+    if (!productsByAsin.has(r.asin)) {
+      productsByAsin.set(r.asin, {
+        asin: r.asin,
+        model: r.model,
+        title: r.title,
+        thumbnail_url: r.thumbnail_url,
+        last_refreshed: r.recomputed_at,
+      });
+    }
+  }
+  return { offers, products: [...productsByAsin.values()], generated_at: body.generated_at };
+}
+```
+
+- [ ] **Step 2: Update `src/lib/gpus/db.ts:hydrateFromSeed`** to prefer the API when configured
+
+Replace the body of `hydrateFromSeed`:
+
+```typescript
+import { fetchFromApi } from './api';
+
+const API_BASE = (typeof window !== 'undefined' ? (window as any).__SORTSAFE_API_BASE : null) ?? import.meta.env?.VITE_API_BASE ?? null;
+
+export async function hydrateFromSeed(seedUrl = '/gpus-seed.json'): Promise<{ inserted: number; deleted: number; generatedAt: number | null } | null> {
+  // Phase 1: prefer cloud API if configured. Fall back to local seed file
+  // (used only by the local dev SPA before Phase 1 deploy completes).
+  const apiSeed = API_BASE ? await fetchFromApi(API_BASE) : null;
+  const seed = apiSeed ?? await fetchLocalSeed(seedUrl);
+  if (!seed?.offers?.length) return null;
+
+  const seedAsins = new Set(seed.offers.map((o) => o.asin));
+  for (const p of seed.products ?? []) seedAsins.add(p.asin);
+
+  let deleted = 0;
+  if (seedAsins.size > 0) {
+    // ... existing per-ASIN delete loop unchanged
+  }
+  await putOffers(seed.offers);
+  if (seed.products) {
+    const t = await tx(['products'], 'readwrite');
+    for (const p of seed.products) t.objectStore('products').put(p);
+    await done(t);
+  }
+  return { inserted: seed.offers.length, deleted, generatedAt: seed.generated_at ?? null };
+}
+
+async function fetchLocalSeed(url: string): Promise<any | null> {
+  let res: Response;
+  try { res = await fetch(url, { cache: 'no-store' }); } catch { return null; }
+  if (!res.ok) return null;
+  return await res.json();
+}
+```
+
+- [ ] **Step 3: Add `VITE_API_BASE` env var hookup in `src/routes/gpus/+page.svelte`** (no UI change — just enables the API path when set)
+
+The `hydrateFromSeed` call is unchanged; setting `VITE_API_BASE=https://sortsafe-api.workers.dev` in `.env` (or at build time) routes through the API.
+
+Add to `.env.example` (create if missing):
+```
+# Set to point /gpus at the cloud Worker. Leave unset for local-seed fallback.
+VITE_API_BASE=
+```
+
+- [ ] **Step 4: Smoke test locally**
+
+```sh
+cd ~/git/sortsafe
+echo 'VITE_API_BASE=' > .env.development.local       # explicit empty: use static seed
+bun run dev
+```
+Visit `http://localhost:5173/gpus` — should still work (falls back to `static/gpus-seed.json` since API base is empty).
+
+Then point at the deployed Worker once it's live (Task 24):
+```sh
+echo 'VITE_API_BASE=https://sortsafe-api.<your-subdomain>.workers.dev' > .env.development.local
+bun run dev
+```
+Visit again — should hydrate from cloud.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add src/lib/gpus/api.ts src/lib/gpus/db.ts src/routes/gpus/+page.svelte .env.example
+git commit -m "feat(spa): hydrateFromApi — read /v1/offers from VITE_API_BASE; fall back to static seed
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 23: Migration backfill script
+
+**Files:**
+- Create: `scripts/migrate-seed-to-cloud.ts`
+
+- [ ] **Step 1: Implement `scripts/migrate-seed-to-cloud.ts`**
+
+```typescript
+/**
+ * One-shot migration: read static/gpus-seed.json, POST it to /v1/admin/import.
+ * Run AFTER the Worker is deployed AND after `wrangler d1 migrations apply --remote`.
+ *
+ * Usage:
+ *   API_BASE=https://sortsafe-api.<sub>.workers.dev SCRAPE_HMAC=<secret> bun scripts/migrate-seed-to-cloud.ts
+ */
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { createHmac } from 'node:crypto';
+
+const SEED_PATH = resolve(process.env.HOME!, 'git/sortsafe/static/gpus-seed.json');
+const API_BASE = process.env.API_BASE ?? '';
+const SCRAPE_HMAC = process.env.SCRAPE_HMAC ?? '';
+
+if (!API_BASE) { console.error('API_BASE env required'); process.exit(1); }
+if (!SCRAPE_HMAC) { console.error('SCRAPE_HMAC env required'); process.exit(1); }
+
+const body = readFileSync(SEED_PATH, 'utf8');
+const sig = createHmac('sha256', SCRAPE_HMAC).update(body).digest('hex');
+
+const r = await fetch(`${API_BASE}/v1/admin/import`, {
+  method: 'POST',
+  headers: { 'content-type': 'application/json', 'x-sortsafe-hmac': sig },
+  body,
+});
+console.log(`HTTP ${r.status}`);
+console.log(await r.text());
+```
+
+- [ ] **Step 2: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add scripts/migrate-seed-to-cloud.ts
+git commit -m "feat(scripts): migrate-seed-to-cloud.ts — HMAC-signed POST of gpus-seed.json to /v1/admin/import
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 24: Production deploy + Discord provisioning + smoke
+
+**Files:** none (operational)
+
+- [ ] **Step 1: Discord one-time provisioning** (per spec §10 / §7.5)
+
+1. Open or create a Discord server you control. Add a `#sortsafe-deals` channel.
+2. Channel Settings → Integrations → Webhooks → New Webhook. Name it "sortsafe". Copy the URL.
+3. Server Settings → Invites → create a never-expiring invite to the server. Copy the URL.
+
+```sh
+cd ~/git/sortsafe/worker
+bunx wrangler secret put KEEPA_API_KEY                  # paste from .env
+bunx wrangler secret put SCRAPE_HMAC                    # generate: openssl rand -hex 32
+bunx wrangler secret put DISCORD_WEBHOOK_URL            # paste cold-start fallback
+bunx wrangler secret put DISCORD_INVITE_URL             # paste invite link
+bunx wrangler secret put JWT_SECRET                     # generate: openssl rand -hex 32
+```
+
+- [ ] **Step 2: Deploy the Worker**
+
+```sh
+cd ~/git/sortsafe/worker
+bunx wrangler deploy
+# Note the deployed URL: e.g. https://sortsafe-api.<your-sub>.workers.dev
+```
+
+- [ ] **Step 3: Seed the discord_config row in production D1**
+
+```sh
+WEBHOOK="<paste-webhook-url>"
+bunx wrangler d1 execute sortsafe-db --remote --command "INSERT OR REPLACE INTO discord_config (id, webhook_url, enabled, updated_at) VALUES (1, '$WEBHOOK', 1, unixepoch()*1000);"
+```
+
+(Once the row exists, the `DISCORD_WEBHOOK_URL` secret is no longer load-bearing — leave it as fallback or `wrangler secret delete` it.)
+
+- [ ] **Step 4: Backfill from existing seed**
+
+```sh
+cd ~/git/sortsafe
+API_BASE=https://sortsafe-api.<sub>.workers.dev SCRAPE_HMAC=<the-hmac-you-set> bun scripts/migrate-seed-to-cloud.ts
+```
+
+Expected: HTTP 200 with `{products_imported: 32, offers_imported: 47}` (or whatever the current seed has).
+
+- [ ] **Step 5: Manual cron trigger**
+
+```sh
+curl -X POST 'https://sortsafe-api.<sub>.workers.dev/__scheduled?cron=*/10+*+*+*+*'
+```
+
+Wait ~30s, then verify D1 has fresh snapshots:
+
+```sh
+bunx wrangler d1 execute sortsafe-db --remote --command "SELECT asin, condition, price_usd, taken_at FROM snapshots ORDER BY taken_at DESC LIMIT 10;"
+```
+
+- [ ] **Step 6: Deploy the Pages SPA**
+
+```sh
+cd ~/git/sortsafe
+echo "VITE_API_BASE=https://sortsafe-api.<sub>.workers.dev" > .env.production
+bun run build
+bunx wrangler pages deploy ./build --project-name=sortsafe-web
+```
+
+Visit the Pages URL (`https://sortsafe-web.pages.dev/gpus`). Verify the offer cards render with cloud-sourced data.
+
+- [ ] **Step 7: Per spec §12 step 4 verification**
+
+Pick 5 ASINs (B0DT7GMXHB, B0FJVQYGQW, etc.). For each:
+
+```sh
+curl -s 'https://sortsafe-api.<sub>.workers.dev/v1/offers?cat=gpu' | jq '.offers[] | select(.asin == "B0DT7GMXHB")'
+```
+
+Cross-reference each result's `current_price_usd` per condition with Keepa's web UI for the same ASIN. Acceptable drift: ≤$5 per condition (timing skew between Keepa's poll and ours). Repeat at +6h and +24h to confirm cron is keeping the data fresh.
+
+- [ ] **Step 8: Disable Termux cron**
+
+Open `crontab -e` and comment the existing line:
+
+```
+# */30 * * * * /data/data/com.termux/files/home/git/sortsafe/scripts/gpus-keepa-cron.sh
+```
+
+DO NOT delete the script — keep as a fallback if the cloud cron has issues.
+
+- [ ] **Step 9: Archive the static seed**
+
+```sh
+cd ~/git/sortsafe
+mkdir -p archive
+git mv static/gpus-seed.json archive/gpus-seed-pre-migration.json
+git commit -m "chore: archive gpus-seed.json after Phase 1 cutover to cloud
+
+— claude-opus-4-7"
+```
+
+- [ ] **Step 10: Drop a smoke message in Discord**
+
+Open `#sortsafe-deals` and confirm at least one cron-driven alert message has arrived OR manually fire one to verify wiring:
+
+```sh
+bunx wrangler d1 execute sortsafe-db --remote --command "INSERT INTO alert_deliveries (delivery_id, rule_id, offer_id, channel, enqueued_at, payload_hash) VALUES ('SMOKE001', '01PHASE1ALERTRULEFORDISCORD', (SELECT best_offer_id FROM current_view LIMIT 1), 'discord', unixepoch()*1000, 'smokehash');"
+```
+
+Then manually push to the queue (CF dashboard: Workers & Pages → sortsafe-api → Queues → sortsafe-alerts → "Send a message" with body `{"delivery_id":"SMOKE001"}`). Within ~10s a Discord message should appear in `#sortsafe-deals`.
+
+- [ ] **Step 11: 24-hour soak**
+
+Walk away. Come back tomorrow. Check:
+1. Cron runs visible in CF dashboard (Workers & Pages → sortsafe-api → Logs / Metrics).
+2. AE events show normal token costs and no bot-wall hits.
+3. R2 has a `d1/<yesterday>.ndjson.gz` backup.
+4. SPA still loads with reasonable data.
+5. Discord channel: at least one auto-fired alert (or a quiet day if no deals crossed the threshold — that's expected behavior).
+
+If all green: **Phase 1 complete.** Friends can now visit the Pages URL.
+
+---
+
+**End of Chunk 7. End of Phase 1 plan.**
+
+**What this delivers:**
+- Cron runs every 10 min on Cloudflare instead of your Termux phone.
+- Real per-condition prices (used / refurbished / Amazon Warehouse) tracked in D1 with 30/90-day medians.
+- Discord webhook posts when any tracked GPU drops ≥15% below its 30-day median.
+- SPA at `/gpus` hydrates from the cloud API; visitors get fresh data without dependency on your phone.
+- Daily R2 backup of D1, 7-day retention.
+- Workers Analytics Engine surfaces token cost, bot-wall hits, alert dispatch latency.
+
+**What's NOT in Phase 1** (Phase 2/3 plans):
+- Per-user PIN auth + Web Push subscriptions.
+- RAM and SSD categories with per-category attribute filters.
+- Custom watchers (user-defined search + threshold).
+- Email channel via Resend.
+- Distributed browser-side scraping.
+- `bunx sortsafe-scrape` CLI.
+- Score sparkline / price-history UI.
+- `/me` page.
+
+Total expected effort: 1 weekend for a focused dev with the spec and this plan in hand.
