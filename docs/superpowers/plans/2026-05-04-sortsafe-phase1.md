@@ -889,7 +889,7 @@ git commit -m "feat(db): typed D1 client helpers + smoke tests for each (8 cases
 
 ## Chunk 2: Keepa client + bot-wall detection + GPU extractor
 
-This chunk adds the upstream data layer: HTTP wrappers for Keepa's `/token`, `/product`, `/search` endpoints; a parser-hardening bot-wall detector that's invoked at every Amazon HTML boundary; and the GPU title→model extractor with a 22-fixture test set. After this chunk: you can call `fetchProducts(env, ['B0DT7GMXHB'])` from a Worker test and see real Keepa data parsed into TS types.
+This chunk adds the upstream data layer: HTTP wrappers for Keepa's `/token`, `/product`, `/search` endpoints; a parser-hardening bot-wall detector that's invoked at every Amazon HTML boundary; and the GPU title→model extractor with a 32-fixture test set. After this chunk: you can call `fetchProducts(env, ['B0DT7GMXHB'])` from a Worker test and see real Keepa data parsed into TS types.
 
 ### Task 4: Bot-wall detector
 
@@ -969,7 +969,8 @@ curl -s "https://www.amazon.com/dp/B0DT7GMXHB" \
   -H 'accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
   -H 'accept-language: en-US,en;q=0.9' \
   -o fixtures/real-pdp-captured.html
-grep -q '<title>Amazon.com:' fixtures/real-pdp-captured.html && echo OK || rm fixtures/real-pdp-captured.html
+# Use the same sentinel the detector uses, not a brittle title-prefix regex.
+grep -q 'id="productTitle"' fixtures/real-pdp-captured.html && echo OK || rm fixtures/real-pdp-captured.html
 ```
 If the file passes the grep, add an extra test: `expect(detectBotWall(fix('real-pdp-captured.html'))).toBe('ok')`. If it doesn't pass (curl returned a bot wall), `rm` removes it and you keep just the synthetic case.
 
@@ -1082,7 +1083,7 @@ git commit -m "feat(keepa): bot-wall detector with sorry/captcha/continue/empty 
 ```typescript
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { env } from 'cloudflare:test';
-import { fetchTokens, fetchProducts, searchTerm, type KeepaProduct } from '../../src/keepa/client';
+import { fetchTokens, fetchProducts, searchTerm } from '../../src/keepa/client';
 
 const mockFetch = (body: unknown, status = 200) => {
   return vi.fn().mockResolvedValue(new Response(JSON.stringify(body), {
@@ -1278,15 +1279,17 @@ git commit -m "feat(keepa): client wrappers for /token, /product, /search with t
 
 - [ ] **Step 1: Write the failing test** at `worker/test/extract/gpu.test.ts`
 
-Use ≥30 real titles from the existing `~/git/sortsafe/static/gpus-seed.json` to assert per-title extraction. Each test row has `(title, expectedModel | null)` — accessory titles assert `null`.
+Use the 32 fixture titles below — a mix of real titles drawn from `~/git/sortsafe/static/gpus-seed.json`, adversarial accessory cases, and edge cases. Each row is `[title, expectedModel | null, tag]`. Tags cluster failures so you know what kind of regex to fix.
 
 ```typescript
 import { describe, it, expect } from 'vitest';
 import { inferModelFromTitle, extractGpuAttrs } from '../../src/extract/gpu';
 
 describe('inferModelFromTitle', () => {
-  // Test cases organized by category so a failure cluster tells you what regex to fix.
-  // ≥30 cases per spec §5.4 / round-1 review feedback.
+  // 32 fixture titles. Tags cluster failures: "real-XYZ" should classify;
+  // "accessory" / "accessory-adversarial" must reject; "wrong-model" verifies
+  // siblings (5070/5080/4080 SUPER) don't false-positive; "edge" covers known
+  // limitations.
   const cases: [string, '3090' | '4090' | '5090' | null, string][] = [
     // Real 3090s — should classify
     ['NVIDIA GeForce RTX 3090 Founders Edition Graphics Card (Renewed)', '3090', 'real-3090'],
@@ -1424,7 +1427,7 @@ export function extractGpuAttrs(p: { asin: string; title: string; brand?: string
 }
 ```
 
-- [ ] **Step 4: Implement `worker/src/extract/price.ts`** — reusable parsers
+- [ ] **Step 4: Implement `worker/src/extract/price.ts`** — reusable parsers (no separate test in this chunk; first real exercise comes from `pipeline/enrich.ts` in Chunk 3 which round-trips both helpers via integration tests)
 
 ```typescript
 import type { GpuCondition } from '../db/types';
@@ -1460,14 +1463,14 @@ export function classifyCondition(label: string | null | undefined): GpuConditio
 cd ~/git/sortsafe/worker && bun test extract
 ```
 
-Expected: all assertions pass (all 22 title cases + 2 attr cases).
+Expected: all assertions pass (all 32 title cases + 2 attr cases).
 
 - [ ] **Step 6: Commit**
 
 ```sh
 cd ~/git/sortsafe
 git add worker/src/extract/ worker/test/extract/
-git commit -m "feat(extract): GPU model + attrs extraction with 22-fixture title test
+git commit -m "feat(extract): GPU model + attrs extraction with 32-fixture title test
 
 — claude-opus-4-7"
 ```
