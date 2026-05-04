@@ -1,0 +1,34 @@
+{
+  "name": "sortsafe",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Multi-category Amazon deal sniper (GPU / RAM / SSD) — Keepa-driven server pipeline + browser-side per-seller scrape.",
+  "scripts": {
+    "dev": "bun ./scripts/vite-cli.ts dev",
+    "build": "bun ./scripts/vite-cli.ts build",
+    "preview": "bun ./scripts/vite-cli.ts preview",
+    "check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
+    "postinstall": "sh postinstall.sh",
+    "seed:gpus": "bun ./scripts/gpus-seed-keepa.ts",
+    "seed:gpus:cron": "./scripts/gpus-keepa-cron.sh",
+    "proxy": "bun ./scripts/gpu-proxy-local.ts"
+  },
+  "devDependencies": {
+    "@rollup/rollup-android-arm64": "4.59.0",
+    "@rollup/wasm-node": "4.59.0",
+    "@sveltejs/adapter-static": "^3.0.8",
+    "@sveltejs/kit": "^2.16.0",
+    "@sveltejs/vite-plugin-svelte": "^5.0.0",
+    "@tailwindcss/vite": "4.2.1",
+    "@types/node": "25.6.0",
+    "node-html-parser": "7.1.0",
+    "svelte": "^5.19.0",
+    "svelte-check": "^4.1.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0"
+  },
+  "dependencies": {
+    "tailwindcss": "^4.0.0"
+  },
+  "type": "module"
+}
