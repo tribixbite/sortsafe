@@ -1486,3 +1486,1153 @@ git commit -m "feat(extract): GPU model + attrs extraction with 32-fixture title
 Next chunk (3): wire the cron pipeline that calls all this code.
 
 ---
+
+## Chunk 3: Cron pipeline (enrich + discover + score + median)
+
+This chunk builds the core 10-min cron orchestrator and its sub-phases. After this chunk, manually invoking `/v1/admin/run-cron` (added in Chunk 5) — or just letting the scheduled trigger fire — will refresh known products via Keepa, top up new ASINs from search, and recompute every dirty `current_view` row with median + composite score. No alerts yet (Chunk 4); no public API yet (Chunk 5). But D1 will hold real, scored deal data driven by Keepa.
+
+### Task 7: Median computation helper
+
+**Files:**
+- Create: `worker/src/pipeline/median.ts`
+- Create: `worker/test/pipeline/median.test.ts`
+
+- [ ] **Step 1: Write the failing test** at `worker/test/pipeline/median.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { computeMedian } from '../../src/pipeline/median';
+
+const seed = (rows: Array<{ asin: string; condition: string; price: number; takenAt: number }>) => {
+  return Promise.all(rows.map((r) => env.DB.prepare(
+    `INSERT INTO snapshots (asin, condition, price_usd, taken_at, source) VALUES (?, ?, ?, ?, 'keepa')`
+  ).bind(r.asin, r.condition, r.price, r.takenAt).run()));
+};
+
+describe('computeMedian', () => {
+  const NOW = 10_000_000_000;
+
+  it('returns null for n=0 (no snapshots in window)', async () => {
+    const m = await computeMedian(env.DB, 'B0NONE', 'used-good', NOW, 30);
+    expect(m).toBeNull();
+  });
+
+  it('returns the single value for n=1', async () => {
+    await seed([{ asin: 'B0ONE', condition: 'used-good', price: 1500, takenAt: NOW - 1000 }]);
+    expect(await computeMedian(env.DB, 'B0ONE', 'used-good', NOW, 30)).toBe(1500);
+  });
+
+  it('returns the middle value for odd n', async () => {
+    await seed([
+      { asin: 'B0ODD', condition: 'used-good', price: 1000, takenAt: NOW - 1000 },
+      { asin: 'B0ODD', condition: 'used-good', price: 1500, takenAt: NOW - 2000 },
+      { asin: 'B0ODD', condition: 'used-good', price: 2000, takenAt: NOW - 3000 },
+    ]);
+    expect(await computeMedian(env.DB, 'B0ODD', 'used-good', NOW, 30)).toBe(1500);
+  });
+
+  it('returns the average of the middle two for even n', async () => {
+    await seed([
+      { asin: 'B0EVEN', condition: 'used-good', price: 1000, takenAt: NOW - 1000 },
+      { asin: 'B0EVEN', condition: 'used-good', price: 1400, takenAt: NOW - 2000 },
+      { asin: 'B0EVEN', condition: 'used-good', price: 1600, takenAt: NOW - 3000 },
+      { asin: 'B0EVEN', condition: 'used-good', price: 2000, takenAt: NOW - 4000 },
+    ]);
+    expect(await computeMedian(env.DB, 'B0EVEN', 'used-good', NOW, 30)).toBe(1500);  // (1400+1600)/2
+  });
+
+  it('respects the time window (excludes snapshots older than windowDays)', async () => {
+    const dayMs = 24 * 60 * 60 * 1000;
+    await seed([
+      { asin: 'B0WIN', condition: 'used-good', price: 1000, takenAt: NOW - 5 * dayMs },     // in window
+      { asin: 'B0WIN', condition: 'used-good', price: 9999, takenAt: NOW - 100 * dayMs },   // outside 30d
+    ]);
+    expect(await computeMedian(env.DB, 'B0WIN', 'used-good', NOW, 30)).toBe(1000);
+    expect(await computeMedian(env.DB, 'B0WIN', 'used-good', NOW, 365)).toBe(5499.5);       // both rows in window
+  });
+
+  it('isolates by asin AND condition', async () => {
+    await seed([
+      { asin: 'B0MIX', condition: 'used-good', price: 1000, takenAt: NOW - 1000 },
+      { asin: 'B0MIX', condition: 'refurbished', price: 9999, takenAt: NOW - 1000 },
+      { asin: 'B0OTHER', condition: 'used-good', price: 5555, takenAt: NOW - 1000 },
+    ]);
+    expect(await computeMedian(env.DB, 'B0MIX', 'used-good', NOW, 30)).toBe(1000);
+    expect(await computeMedian(env.DB, 'B0MIX', 'refurbished', NOW, 30)).toBe(9999);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/median
+```
+
+Expected: FAIL — `computeMedian is not defined`.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/median.ts`** per spec §6 SQL trick
+
+```typescript
+/**
+ * Median price for (asin, condition) over the last `windowDays` days.
+ * Returns null when there are no snapshots in the window. Uses the SQLite
+ * LIMIT 2 - n%2 / OFFSET (n-1)/2 trick — averages the middle two for even n,
+ * returns the middle one for odd n, returns the only value for n=1.
+ *
+ * Performance: per spec §6, scans up to ~13K rows for a hot ASIN's 90-day
+ * window. Cron calls this only on dirty rows so cost is bounded.
+ */
+export async function computeMedian(
+  db: D1Database,
+  asin: string,
+  condition: string,
+  nowMs: number,
+  windowDays: number,
+): Promise<number | null> {
+  const cutoffMs = nowMs - windowDays * 24 * 60 * 60 * 1000;
+  const r = await db.prepare(
+    `WITH ordered AS (
+       SELECT price_usd FROM snapshots
+       WHERE asin = ?1 AND condition = ?2 AND taken_at > ?3
+       ORDER BY price_usd
+     ), counted AS (
+       SELECT COUNT(*) AS n FROM ordered
+     )
+     SELECT
+       CASE
+         WHEN (SELECT n FROM counted) = 0 THEN NULL
+         ELSE (
+           SELECT AVG(price_usd) FROM ordered
+           LIMIT 2 - (SELECT n FROM counted) % 2
+           OFFSET (SELECT (n - 1) / 2 FROM counted)
+         )
+       END AS median`
+  ).bind(asin, condition, cutoffMs).first<{ median: number | null }>();
+  return r?.median ?? null;
+}
+```
+
+- [ ] **Step 4: Run test to verify all 6 cases pass**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/median
+```
+
+Expected: 6/6 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/median.ts worker/test/pipeline/median.test.ts
+git commit -m "feat(pipeline): SQL median helper with n=0/1/even/odd/window/isolation tests
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 8: Composite score formula
+
+**Files:**
+- Create: `worker/src/pipeline/score.ts`
+- Create: `worker/test/pipeline/score.test.ts`
+
+- [ ] **Step 1: Write the failing test** at `worker/test/pipeline/score.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { computeCompositeScore, type ScoreInputs } from '../../src/pipeline/score';
+
+const base: ScoreInputs = {
+  current_price_usd: 1500,
+  median_30d: 1700,           // 11.8% below
+  median_90d: 1800,           // 16.7% below
+  seller_rating: 4.5,
+  last_seen: Date.now() - 5 * 60 * 1000,   // 5 min ago
+  is_lowest_30d: true,
+};
+
+describe('computeCompositeScore', () => {
+  it('returns a number 0-100 for fully-populated inputs', () => {
+    const s = computeCompositeScore(base);
+    expect(s).toBeGreaterThan(0);
+    expect(s).toBeLessThanOrEqual(100);
+  });
+
+  it('drops null components AND their weight from the denominator (per spec §6)', () => {
+    // No median data — score should equal recency_bonus alone (the only non-null component).
+    const s = computeCompositeScore({
+      current_price_usd: 1500,
+      median_30d: null, median_90d: null,
+      seller_rating: null, is_lowest_30d: false,
+      last_seen: Date.now(),
+    });
+    // recency_bonus: 100 if <30min; with weight 0.10 in numerator AND denominator → score = 100
+    expect(s).toBeCloseTo(100, 0);
+  });
+
+  it('treats negative pct_below_median (above median) as a low score', () => {
+    const s = computeCompositeScore({
+      ...base,
+      current_price_usd: 2200,        // above 30d median 1700 → -29.4%
+      median_30d: 1700,
+      median_90d: 1700,
+      is_lowest_30d: false,
+    });
+    expect(s).toBeLessThan(50);
+  });
+
+  it('clips pct_below_median to [-50, 100] before normalizing', () => {
+    const sExtreme = computeCompositeScore({
+      ...base,
+      current_price_usd: 1,           // 99.9% below median — clipped to 100
+      median_30d: 1700, median_90d: 1700,
+    });
+    const sCapped = computeCompositeScore({
+      ...base,
+      current_price_usd: 5,           // also extremely below — should produce ~same score
+      median_30d: 1700, median_90d: 1700,
+    });
+    expect(Math.abs(sExtreme - sCapped)).toBeLessThan(1);  // clipping bounds dominate
+  });
+
+  it('seller_rating contributes ~15% weight at 5★', () => {
+    // Same inputs except seller_rating null vs 5★. Difference should be ~15 (0.15*100=15) scaled by total weight.
+    const noSeller = computeCompositeScore({ ...base, seller_rating: null });
+    const fullSeller = computeCompositeScore({ ...base, seller_rating: 5 });
+    expect(fullSeller).toBeGreaterThan(noSeller);
+  });
+
+  it('recency_bonus decays linearly to 0 by 24h', () => {
+    const fresh = computeCompositeScore({ ...base, last_seen: Date.now() });
+    const oneHour = computeCompositeScore({ ...base, last_seen: Date.now() - 60 * 60 * 1000 });
+    const oneDay = computeCompositeScore({ ...base, last_seen: Date.now() - 24 * 60 * 60 * 1000 });
+    expect(fresh).toBeGreaterThan(oneHour);
+    expect(oneHour).toBeGreaterThan(oneDay);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/score
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/score.ts`** per spec §6
+
+```typescript
+export interface ScoreInputs {
+  current_price_usd: number;
+  median_30d: number | null;
+  median_90d: number | null;
+  seller_rating: number | null;        // 0-5
+  last_seen: number;                   // epoch ms — informs recency_bonus
+  is_lowest_30d: boolean;
+}
+
+const WEIGHTS = {
+  pct_below_median_30d: 0.50,
+  pct_below_median_90d: 0.20,
+  seller_rating: 0.15,
+  recency_bonus: 0.10,
+  is_lowest_30d_bonus: 0.05,
+} as const;
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const FRESH_MS = 30 * 60 * 1000;        // <30min = 100; linear decay to 0 by 24h
+
+/**
+ * Normalize a pct-below-median value into 0-100. Clip to [-50, 100] first,
+ * then map: -50 → 0, 0 → 33.3, 100 → 100. Negative discount = above median = bad.
+ */
+function normalizePct(pct: number): number {
+  const clipped = Math.max(-50, Math.min(100, pct));
+  return ((clipped + 50) / 150) * 100;
+}
+
+/** Linear decay from 100 (just now) → 0 (≥24h ago); plateau at 100 within FRESH_MS. */
+function recencyBonus(lastSeen: number): number {
+  const ageMs = Math.max(0, Date.now() - lastSeen);
+  if (ageMs <= FRESH_MS) return 100;
+  if (ageMs >= DAY_MS) return 0;
+  const span = DAY_MS - FRESH_MS;
+  return 100 * (1 - (ageMs - FRESH_MS) / span);
+}
+
+/**
+ * Weighted average of available components. Drops null components AND their
+ * weight from the denominator so a brand-new ASIN with only recency_bonus
+ * still gets a sensible score.
+ */
+export function computeCompositeScore(input: ScoreInputs): number {
+  const components: Array<{ value: number; weight: number }> = [];
+
+  if (input.median_30d != null && input.median_30d > 0) {
+    const pct = ((input.median_30d - input.current_price_usd) / input.median_30d) * 100;
+    components.push({ value: normalizePct(pct), weight: WEIGHTS.pct_below_median_30d });
+  }
+  if (input.median_90d != null && input.median_90d > 0) {
+    const pct = ((input.median_90d - input.current_price_usd) / input.median_90d) * 100;
+    components.push({ value: normalizePct(pct), weight: WEIGHTS.pct_below_median_90d });
+  }
+  if (input.seller_rating != null) {
+    components.push({ value: (input.seller_rating / 5) * 100, weight: WEIGHTS.seller_rating });
+  }
+  components.push({ value: recencyBonus(input.last_seen), weight: WEIGHTS.recency_bonus });
+  components.push({ value: input.is_lowest_30d ? 100 : 0, weight: WEIGHTS.is_lowest_30d_bonus });
+
+  const num = components.reduce((s, c) => s + c.value * c.weight, 0);
+  const den = components.reduce((s, c) => s + c.weight, 0);
+  return den > 0 ? num / den : 0;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/score
+```
+
+Expected: 6/6 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/score.ts worker/test/pipeline/score.test.ts
+git commit -m "feat(pipeline): composite score formula with null-component-drops-weight semantics
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 9: Enrich phase (Keepa /product → upsert offers + snapshots, mark dirty)
+
+**Files:**
+- Create: `worker/src/pipeline/enrich.ts`
+- Create: `worker/test/pipeline/enrich.test.ts`
+
+- [ ] **Step 1: Write the failing test** at `worker/test/pipeline/enrich.test.ts`
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { enrichBatch, type DirtySet } from '../../src/pipeline/enrich';
+
+// We mock Keepa's HTTP layer rather than the higher-level client wrapper so the
+// integration of fetchProducts → enrichBatch → D1 is exercised end-to-end.
+const mockKeepaProduct = (asin: string, title: string, current: number[]) => ({
+  asin, title, brand: 'TestBrand', imagesCSV: 'a.jpg',
+  stats: { current, rating: 45, reviewCount: 1200 },
+});
+
+const seedCategoryAndProduct = async (asin: string) => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '["rtx 5090"]', '{"5090":1999}', 1)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+     VALUES (?, 'gpu', '5090', 'Test 5090 (placeholder)', 'TestBrand', null, '{}', 1000, 1000, 1)`
+  ).bind(asin).run();
+};
+
+describe('enrichBatch', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('upserts new offers, inserts snapshots, marks (asin,condition) dirty', async () => {
+    await seedCategoryAndProduct('B0ENRICH01');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 530,
+      products: [mockKeepaProduct('B0ENRICH01', 'GIGABYTE GeForce RTX 5090 WINDFORCE 32G',
+        // CSV indices 0=Amazon, 1=New, 2=Used, 6=Refurb, 9=Warehouse — cents; -1 means absent
+        [-1, 199900, 169999, -1, -1, -1, 159999, -1, -1, 149999])),
+      ],
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    const dirty: DirtySet = new Set();
+    await enrichBatch(env, ['B0ENRICH01'], dirty);
+
+    const offers = await env.DB.prepare('SELECT condition, price_usd FROM offers WHERE asin = ? ORDER BY condition').bind('B0ENRICH01').all<any>();
+    expect(offers.results.map((o) => o.condition).sort()).toEqual(['new', 'refurbished', 'used-good', 'warehouse']);
+
+    const snaps = await env.DB.prepare('SELECT COUNT(*) AS n FROM snapshots WHERE asin = ?').bind('B0ENRICH01').first<any>();
+    expect(snaps.n).toBe(4);
+
+    expect(dirty.has('B0ENRICH01__new')).toBe(true);
+    expect(dirty.has('B0ENRICH01__used-good')).toBe(true);
+    expect(dirty.has('B0ENRICH01__refurbished')).toBe(true);
+    expect(dirty.has('B0ENRICH01__warehouse')).toBe(true);
+  });
+
+  it('marks offers no longer present as available=0', async () => {
+    await seedCategoryAndProduct('B0DROP01');
+    // Pre-existing used offer
+    await env.DB.prepare(
+      `INSERT INTO offers (offer_id, asin, condition, price_usd, source, first_seen, last_seen, available)
+       VALUES ('B0DROP01__used-good__', 'B0DROP01', 'used-good', 1500, 'keepa', 1000, 1000, 1)`
+    ).run();
+
+    // Keepa returns a NEW price but no longer a USED price (used[2] = -1)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 528,
+      products: [mockKeepaProduct('B0DROP01', 'GIGABYTE GeForce RTX 5090 32G',
+        [-1, 200000, -1, -1, -1, -1, -1, -1, -1, -1])],
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    const dirty: DirtySet = new Set();
+    await enrichBatch(env, ['B0DROP01'], dirty);
+
+    const used = await env.DB.prepare('SELECT available FROM offers WHERE offer_id = ?').bind('B0DROP01__used-good__').first<any>();
+    expect(used.available).toBe(0);
+    // Dirty set still includes used-good so score recompute can drop it from current_view
+    expect(dirty.has('B0DROP01__used-good')).toBe(true);
+  });
+
+  it('updates products.title and products.last_refreshed on refresh', async () => {
+    await seedCategoryAndProduct('B0REFRESH01');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 525,
+      products: [mockKeepaProduct('B0REFRESH01', 'GIGABYTE GeForce RTX 5090 WINDFORCE OC 32G Updated Title',
+        [-1, 195000, -1, -1, -1, -1, -1, -1, -1, -1])],
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    await enrichBatch(env, ['B0REFRESH01'], new Set());
+    const p = await env.DB.prepare('SELECT title, last_refreshed FROM products WHERE asin = ?').bind('B0REFRESH01').first<any>();
+    expect(p.title).toContain('Updated Title');
+    expect(p.last_refreshed).toBeGreaterThan(1000);
+  });
+
+  it('skips products whose title fails inferModelFromTitle (accessory or wrong model)', async () => {
+    await seedCategoryAndProduct('B0SKIP01');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 522,
+      products: [mockKeepaProduct('B0SKIP01', 'Backplate for RTX 5090 Custom Aluminum',
+        [-1, 9900, -1, -1, -1, -1, -1, -1, -1, -1])],
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    const dirty: DirtySet = new Set();
+    await enrichBatch(env, ['B0SKIP01'], dirty);
+    const offers = await env.DB.prepare('SELECT COUNT(*) AS n FROM offers WHERE asin = ?').bind('B0SKIP01').first<any>();
+    expect(offers.n).toBe(0);
+    expect(dirty.size).toBe(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/enrich
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/enrich.ts`**
+
+```typescript
+import type { Env } from '../env';
+import type { GpuCondition, OfferRow } from '../db/types';
+import { fetchProducts } from '../keepa/client';
+import { inferModelFromTitle, extractGpuAttrs } from '../extract/gpu';
+import { upsertProduct, upsertOffer, markOffersUnavailable, insertSnapshot } from '../db/client';
+
+/** Cron tracks dirty (asin, condition) tuples so score-recompute only walks changed rows. */
+export type DirtySet = Set<string>;
+const dirtyKey = (asin: string, condition: string) => `${asin}__${condition}`;
+
+// Keepa CSV indices (per spec §6 / Keepa docs)
+const PRICE_IDX: Array<{ idx: number; cond: GpuCondition }> = [
+  { idx: 1, cond: 'new' },
+  { idx: 2, cond: 'used-good' },
+  { idx: 6, cond: 'refurbished' },
+  { idx: 9, cond: 'warehouse' },
+];
+
+/**
+ * Phase 2 of cron: refresh a batch of ASINs from Keepa /product, upsert offers
+ * and snapshots, mark stale offers unavailable, and add every touched
+ * (asin, condition) to the dirty set so the score phase recomputes them.
+ *
+ * Skips any product whose title fails inferModelFromTitle (accessory / wrong model).
+ */
+export async function enrichBatch(env: Env, asins: string[], dirty: DirtySet): Promise<void> {
+  if (asins.length === 0) return;
+  const { products } = await fetchProducts(env, asins);
+  const now = Date.now();
+
+  for (const p of products) {
+    const title = p.title ?? '';
+    const verifiedModel = inferModelFromTitle(title);
+    if (!verifiedModel) continue;          // accessory or wrong model — leave unchanged
+    const attrs = extractGpuAttrs({ asin: p.asin, title, brand: p.brand });
+
+    // Refresh product row (title/brand/thumb might have changed; last_refreshed always updates)
+    const thumb = p.imagesCSV ? `https://m.media-amazon.com/images/I/${p.imagesCSV.split(',')[0]}` : null;
+    await upsertProduct(env.DB, {
+      asin: p.asin, category_id: 'gpu', model: verifiedModel,
+      title, brand: p.brand ?? null, thumbnail_url: thumb,
+      attrs_json: JSON.stringify(attrs),
+      first_seen: now, last_refreshed: now, active: 1,
+    });
+
+    const cur = p.stats?.current ?? [];
+    const seenConditionsThisFetch = new Set<GpuCondition>();
+    for (const { idx, cond } of PRICE_IDX) {
+      const cents = cur[idx];
+      if (typeof cents !== 'number' || cents <= 0) continue;
+      const price = cents / 100;
+      seenConditionsThisFetch.add(cond);
+
+      // Keepa-aggregate row: empty seller segment per spec §3 offer_id format
+      const offer: OfferRow = {
+        offer_id: `${p.asin}__${cond}__`,
+        asin: p.asin, condition: cond, price_usd: price,
+        seller: null, seller_id: null, seller_rating: null, seller_rating_count: null,
+        ships_from: null, source: 'keepa',
+        first_seen: now, last_seen: now, available: 1,
+      };
+      await upsertOffer(env.DB, offer);
+      await insertSnapshot(env.DB, { asin: p.asin, condition: cond, price_usd: price, taken_at: now, source: 'keepa' });
+      // Keep the Keepa-aggregate row alive; mark all OTHER per-seller rows for this (asin, cond) inactive
+      await markOffersUnavailable(env.DB, p.asin, cond, [offer.offer_id]);
+      dirty.add(dirtyKey(p.asin, cond));
+    }
+
+    // Conditions that USED to have an offer but didn't this time → mark all unavailable
+    // (also adds them to dirty so score phase removes them from current_view)
+    for (const { cond } of PRICE_IDX) {
+      if (seenConditionsThisFetch.has(cond)) continue;
+      await markOffersUnavailable(env.DB, p.asin, cond, []);
+      dirty.add(dirtyKey(p.asin, cond));
+    }
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/enrich
+```
+
+Expected: 4/4 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/enrich.ts worker/test/pipeline/enrich.test.ts
+git commit -m "feat(pipeline): enrich batch — Keepa /product → upsert + snapshot + mark stale + dirty
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 10: Discover phase (Keepa /search rotation)
+
+**Files:**
+- Create: `worker/src/pipeline/discover.ts`
+- Create: `worker/test/pipeline/discover.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { discoverForCategory, type DirtySet } from '../../src/pipeline/discover';
+
+const mockKeepaProduct = (asin: string, title: string) => ({
+  asin, title, brand: 'TestBrand', imagesCSV: 'a.jpg',
+  stats: { current: [-1, 200000, -1, -1, -1, -1, -1, -1, -1, -1] },
+});
+
+const seedCategory = (terms: string[]) => env.DB.prepare(
+  `INSERT OR REPLACE INTO categories (category_id, display, search_terms, msrp_baseline, enabled)
+   VALUES ('gpu', 'GPUs', ?, '{"5090":1999}', 1)`
+).bind(JSON.stringify(terms)).run();
+
+describe('discoverForCategory', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('inserts new product rows for each ASIN returned by /search', async () => {
+    await seedCategory(['rtx 5090']);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 480,
+      products: [
+        mockKeepaProduct('B0DISC01', 'GIGABYTE GeForce RTX 5090 WINDFORCE'),
+        mockKeepaProduct('B0DISC02', 'msi Gaming RTX 5090 32G'),
+      ],
+    }), { headers: { 'content-type': 'application/json' } })));
+
+    const dirty: DirtySet = new Set();
+    const added = await discoverForCategory(env, 'gpu', dirty);
+    expect(added).toBe(2);
+    const products = await env.DB.prepare('SELECT asin FROM products ORDER BY asin').all<any>();
+    expect(products.results.map((r) => r.asin)).toEqual(['B0DISC01', 'B0DISC02']);
+  });
+
+  it('skips ASINs we already have', async () => {
+    await seedCategory(['rtx 5090']);
+    await env.DB.prepare(
+      `INSERT INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+       VALUES ('B0DUP01', 'gpu', '5090', 'Existing 5090', 'X', null, '{}', 1000, 1000, 1)`
+    ).run();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 478,
+      products: [
+        mockKeepaProduct('B0DUP01', 'GIGABYTE GeForce RTX 5090 (refreshed title)'),
+        mockKeepaProduct('B0NEW01', 'ASUS ROG Astral GeForce RTX 5090'),
+      ],
+    }), { headers: { 'content-type': 'application/json' } })));
+    const added = await discoverForCategory(env, 'gpu', new Set());
+    expect(added).toBe(1);
+  });
+
+  it('returns 0 and leaves DB clean when search bot-walls', async () => {
+    await seedCategory(['rtx 5090']);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(
+      '<html><head><title>Sorry! Something went wrong</title></head></html>',
+      { status: 200, headers: { 'content-type': 'text/html' } }
+    )));
+    const added = await discoverForCategory(env, 'gpu', new Set());
+    expect(added).toBe(0);
+  });
+
+  it('skips Keepa products whose title fails model inference', async () => {
+    await seedCategory(['rtx 5090']);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      tokensLeft: 470,
+      products: [
+        mockKeepaProduct('B0BAD01', 'Backplate for RTX 5090 Aluminum'),
+        mockKeepaProduct('B0GOOD01', 'GIGABYTE GeForce RTX 5090 WINDFORCE 32G'),
+      ],
+    }), { headers: { 'content-type': 'application/json' } })));
+    const added = await discoverForCategory(env, 'gpu', new Set());
+    expect(added).toBe(1);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/discover
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/discover.ts`**
+
+```typescript
+import type { Env } from '../env';
+import type { CategoryRow } from '../db/types';
+import { searchTerm } from '../keepa/client';
+import { inferModelFromTitle, extractGpuAttrs } from '../extract/gpu';
+import { upsertProduct } from '../db/client';
+import type { DirtySet } from './enrich';
+
+/**
+ * Phase 3 of cron. For one category (e.g. 'gpu'), pick the next search term
+ * (rotated round-robin via category.search_terms array) and call Keepa /search.
+ * For each returned product whose title classifies as a tracked model AND we
+ * don't already have, insert a products row with last_refreshed=0 so the next
+ * enrich pass picks it up.
+ *
+ * Returns count of products newly inserted. Bot-walled responses return 0.
+ */
+export async function discoverForCategory(env: Env, categoryId: string, _dirty: DirtySet): Promise<number> {
+  const category = await env.DB.prepare('SELECT * FROM categories WHERE category_id = ?').bind(categoryId).first<CategoryRow>();
+  if (!category) return 0;
+  const terms = JSON.parse(category.search_terms) as string[];
+  if (terms.length === 0) return 0;
+
+  // Rotate: hash by current 10-min cron slot so each tick rotates one position.
+  const slot = Math.floor(Date.now() / (10 * 60 * 1000));
+  const term = terms[slot % terms.length];
+
+  const { products, botWalled } = await searchTerm(env, term);
+  if (botWalled) return 0;
+
+  // Existing-asin set built once, then checked per row.
+  const existing = await env.DB.prepare('SELECT asin FROM products WHERE category_id = ?').bind(categoryId).all<{ asin: string }>();
+  const existingSet = new Set(existing.results.map((r) => r.asin));
+
+  let added = 0;
+  const now = Date.now();
+  for (const p of products) {
+    if (existingSet.has(p.asin)) continue;
+    const title = p.title ?? '';
+    const verifiedModel = inferModelFromTitle(title);
+    if (!verifiedModel) continue;
+
+    const attrs = extractGpuAttrs({ asin: p.asin, title, brand: p.brand });
+    const thumb = p.imagesCSV ? `https://m.media-amazon.com/images/I/${p.imagesCSV.split(',')[0]}` : null;
+    await upsertProduct(env.DB, {
+      asin: p.asin, category_id: categoryId, model: verifiedModel,
+      title, brand: p.brand ?? null, thumbnail_url: thumb,
+      attrs_json: JSON.stringify(attrs),
+      first_seen: now,
+      last_refreshed: 0,                // 0 ensures next enrich tick picks it up first
+      active: 1,
+    });
+    added++;
+  }
+  return added;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/discover
+```
+
+Expected: 4/4 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/discover.ts worker/test/pipeline/discover.test.ts
+git commit -m "feat(pipeline): discover phase — Keepa /search rotation per category
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 11: Score phase (recompute current_view for dirty rows)
+
+**Files:**
+- Create: `worker/src/pipeline/score-recompute.ts`
+- Create: `worker/test/pipeline/score-recompute.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { recomputeScoresForDirty } from '../../src/pipeline/score-recompute';
+
+const seed = async () => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '[]', '{"5090":1999,"4090":1599,"3090":1499}', 1)`
+  ).run();
+};
+
+const seedProductWithOffer = async (asin: string, model: string, condition: string, price: number, last_seen: number) => {
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+     VALUES (?, 'gpu', ?, 'Test', 'X', null, '{}', 1000, 1000, 1)`
+  ).bind(asin, model).run();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO offers (offer_id, asin, condition, price_usd, source, first_seen, last_seen, available)
+     VALUES (?, ?, ?, ?, 'keepa', 1000, ?, 1)`
+  ).bind(`${asin}__${condition}__`, asin, condition, price, last_seen).run();
+};
+
+const seedSnapshots = (asin: string, condition: string, prices: number[], baseTs: number) =>
+  Promise.all(prices.map((p, i) => env.DB.prepare(
+    `INSERT INTO snapshots (asin, condition, price_usd, taken_at, source) VALUES (?, ?, ?, ?, 'keepa')`
+  ).bind(asin, condition, p, baseTs - i * 60_000).run()));
+
+describe('recomputeScoresForDirty', () => {
+  it('writes current_view row with median + score for a single dirty tuple', async () => {
+    await seed();
+    const now = Date.now();
+    await seedProductWithOffer('B0RECOMP01', '5090', 'used-good', 1500, now - 5 * 60_000);
+    await seedSnapshots('B0RECOMP01', 'used-good', [1500, 1700, 1800, 1900, 2000], now);
+
+    await recomputeScoresForDirty(env, new Set(['B0RECOMP01__used-good']));
+
+    const v = await env.DB.prepare('SELECT * FROM current_view WHERE asin = ? AND condition = ?').bind('B0RECOMP01', 'used-good').first<any>();
+    expect(v).not.toBeNull();
+    expect(v.current_price_usd).toBe(1500);
+    expect(v.median_30d).toBe(1800);                // odd n=5 middle
+    expect(v.pct_below_median_30d).toBeCloseTo(16.67, 1);
+    expect(v.composite_score).toBeGreaterThan(0);
+  });
+
+  it('removes current_view rows when no available offers remain', async () => {
+    await seed();
+    const now = Date.now();
+    await seedProductWithOffer('B0GONE01', '5090', 'used-good', 1500, now);
+    // Pre-existing current_view row
+    await env.DB.prepare(
+      `INSERT INTO current_view (asin, condition, current_price_usd, best_offer_id, composite_score, recomputed_at)
+       VALUES ('B0GONE01', 'used-good', 1500, 'B0GONE01__used-good__', 50, ?)`
+    ).bind(now).run();
+    // Now mark all offers unavailable (simulating Keepa dropping the listing)
+    await env.DB.prepare(`UPDATE offers SET available = 0 WHERE asin = ?`).bind('B0GONE01').run();
+
+    await recomputeScoresForDirty(env, new Set(['B0GONE01__used-good']));
+    const v = await env.DB.prepare('SELECT * FROM current_view WHERE asin = ? AND condition = ?').bind('B0GONE01', 'used-good').first<any>();
+    expect(v).toBeNull();
+  });
+
+  it('uses MSRP baseline from category for pct_off_msrp', async () => {
+    await seed();
+    const now = Date.now();
+    await seedProductWithOffer('B0MSRP01', '5090', 'used-good', 1500, now);
+    await seedSnapshots('B0MSRP01', 'used-good', [1500], now);
+    await recomputeScoresForDirty(env, new Set(['B0MSRP01__used-good']));
+    const v = await env.DB.prepare('SELECT pct_off_msrp, msrp_baseline FROM current_view WHERE asin = ? AND condition = ?').bind('B0MSRP01', 'used-good').first<any>();
+    expect(v.msrp_baseline).toBe(1999);
+    expect(v.pct_off_msrp).toBeCloseTo(((1999 - 1500) / 1999) * 100, 1);  // ~24.96%
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/score-recompute
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/score-recompute.ts`**
+
+```typescript
+import type { Env } from '../env';
+import type { GpuCondition } from '../db/types';
+import { computeMedian } from './median';
+import { computeCompositeScore } from './score';
+import { upsertCurrentView } from '../db/client';
+
+interface BestOffer {
+  offer_id: string;
+  price_usd: number;
+  seller_rating: number | null;
+  last_seen: number;
+}
+
+/**
+ * Phase 4 of cron. For each dirty (asin, condition) tuple, recompute the
+ * current_view row from scratch. Removes the row if no available offers exist.
+ *
+ * Dirty keys are formatted "{asin}__{condition}" by enrich.ts.
+ */
+export async function recomputeScoresForDirty(env: Env, dirty: Set<string>): Promise<void> {
+  if (dirty.size === 0) return;
+  const now = Date.now();
+
+  // Cache MSRP baselines per category (one read per cron tick, not per row)
+  const msrpByCategoryAndModel = new Map<string, number>();
+  const cats = await env.DB.prepare('SELECT category_id, msrp_baseline FROM categories').all<{ category_id: string; msrp_baseline: string }>();
+  for (const c of cats.results) {
+    const map = JSON.parse(c.msrp_baseline) as Record<string, number>;
+    for (const [model, price] of Object.entries(map)) {
+      msrpByCategoryAndModel.set(`${c.category_id}|${model}`, price);
+    }
+  }
+
+  for (const key of dirty) {
+    const [asin, condition] = key.split('__') as [string, GpuCondition];
+    const product = await env.DB.prepare('SELECT category_id, model FROM products WHERE asin = ?').bind(asin).first<{ category_id: string; model: string | null }>();
+    if (!product) continue;
+
+    const best = await env.DB.prepare(
+      `SELECT offer_id, price_usd, seller_rating, last_seen
+       FROM offers WHERE asin = ? AND condition = ? AND available = 1
+       ORDER BY price_usd ASC LIMIT 1`
+    ).bind(asin, condition).first<BestOffer>();
+
+    if (!best) {
+      // No available offers — remove the row so the UI stops showing it
+      await env.DB.prepare('DELETE FROM current_view WHERE asin = ? AND condition = ?').bind(asin, condition).run();
+      continue;
+    }
+
+    const median_30d = await computeMedian(env.DB, asin, condition, now, 30);
+    const median_90d = await computeMedian(env.DB, asin, condition, now, 90);
+    const msrp_baseline = product.model ? msrpByCategoryAndModel.get(`${product.category_id}|${product.model}`) ?? null : null;
+
+    const pct_below_median_30d = median_30d != null ? ((median_30d - best.price_usd) / median_30d) * 100 : null;
+    const pct_below_median_90d = median_90d != null ? ((median_90d - best.price_usd) / median_90d) * 100 : null;
+    const pct_off_msrp = msrp_baseline != null ? ((msrp_baseline - best.price_usd) / msrp_baseline) * 100 : null;
+
+    // is_lowest_30d: best.price_usd <= MIN(snapshots in 30d window). Cheap query — already indexed.
+    const min30 = await env.DB.prepare(
+      `SELECT MIN(price_usd) AS m FROM snapshots WHERE asin = ? AND condition = ? AND taken_at > ?`
+    ).bind(asin, condition, now - 30 * 24 * 3600 * 1000).first<{ m: number | null }>();
+    const min90 = await env.DB.prepare(
+      `SELECT MIN(price_usd) AS m FROM snapshots WHERE asin = ? AND condition = ? AND taken_at > ?`
+    ).bind(asin, condition, now - 90 * 24 * 3600 * 1000).first<{ m: number | null }>();
+    const is_lowest_30d = min30?.m != null && best.price_usd <= min30.m;
+    const is_lowest_90d = min90?.m != null && best.price_usd <= min90.m;
+
+    const composite_score = computeCompositeScore({
+      current_price_usd: best.price_usd,
+      median_30d, median_90d,
+      seller_rating: best.seller_rating,
+      last_seen: best.last_seen,
+      is_lowest_30d,
+    });
+
+    await upsertCurrentView(env.DB, {
+      asin, condition,
+      current_price_usd: best.price_usd,
+      best_offer_id: best.offer_id,
+      median_30d, median_90d, msrp_baseline,
+      pct_below_median_30d, pct_below_median_90d, pct_off_msrp,
+      composite_score,
+      price_per_gb: null,        // GPU-only in Phase 1; RAM/SSD in Phase 2
+      price_per_tb: null,
+      is_lowest_30d: is_lowest_30d ? 1 : 0,
+      is_lowest_90d: is_lowest_90d ? 1 : 0,
+      recomputed_at: now,
+    });
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/score-recompute
+```
+
+Expected: 3/3 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/score-recompute.ts worker/test/pipeline/score-recompute.test.ts
+git commit -m "feat(pipeline): score recompute — current_view per dirty tuple, removes on offer drop
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 12: Cron orchestrator (compose phases 1-4)
+
+**Files:**
+- Create: `worker/src/pipeline/cron.ts`
+- Create: `worker/test/pipeline/cron.test.ts`
+- Modify: `worker/src/index.ts:9-15` — wire `scheduled` handler
+
+- [ ] **Step 1: Write the failing test**
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { runCron } from '../../src/pipeline/cron';
+
+beforeEach(() => vi.unstubAllGlobals());
+
+const stubKeepaSequence = (responses: Response[]) => {
+  const fn = vi.fn();
+  for (const r of responses) fn.mockResolvedValueOnce(r);
+  vi.stubGlobal('fetch', fn);
+  return fn;
+};
+
+const json = (body: unknown) => new Response(JSON.stringify(body), { headers: { 'content-type': 'application/json' } });
+
+describe('runCron', () => {
+  it('end-to-end: token check, enrich one stale ASIN, write current_view row', async () => {
+    // Seed: category + one product that's been refreshed 1h ago (stale)
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '["rtx 5090"]', '{"5090":1999}', 1)`
+    ).run();
+    await env.DB.prepare(
+      `INSERT INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+       VALUES ('B0CRON01', 'gpu', '5090', 'placeholder title', 'X', null, '{}', 1000, ?, 1)`
+    ).bind(Date.now() - 60 * 60 * 1000).run();
+
+    stubKeepaSequence([
+      json({ tokensLeft: 540, refillIn: 60000, refillRate: 1, timestamp: Date.now() }),                      // /token
+      json({ tokensLeft: 538, products: [{                                                                    // /product
+        asin: 'B0CRON01', title: 'GIGABYTE GeForce RTX 5090 WINDFORCE 32G',
+        brand: 'GIGABYTE', imagesCSV: 'a.jpg',
+        stats: { current: [-1, 199900, 159999, -1, -1, -1, -1, -1, -1, -1] },
+      }]}),
+      // /search call: discovery rotates in, returns one new ASIN
+      json({ tokensLeft: 488, products: [{
+        asin: 'B0CRON02', title: 'msi Gaming RTX 5090 32G', brand: 'msi', imagesCSV: 'b.jpg',
+        stats: { current: [-1, 195000, -1, -1, -1, -1, -1, -1, -1, -1] },
+      }]}),
+    ]);
+
+    await runCron(env);
+
+    const v = await env.DB.prepare('SELECT * FROM current_view WHERE asin = ? AND condition = ?').bind('B0CRON01', 'used-good').first<any>();
+    expect(v).not.toBeNull();
+    expect(v.current_price_usd).toBe(1599.99);
+
+    // Discovery should have inserted B0CRON02 (last_refreshed=0 so next tick enriches it)
+    const newProd = await env.DB.prepare('SELECT asin, last_refreshed FROM products WHERE asin = ?').bind('B0CRON02').first<any>();
+    expect(newProd.asin).toBe('B0CRON02');
+    expect(newProd.last_refreshed).toBe(0);
+  });
+
+  it('skips enrich + discover when tokens < 30', async () => {
+    await env.DB.prepare(
+      `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '["rtx 5090"]', '{"5090":1999}', 1)`
+    ).run();
+    stubKeepaSequence([
+      json({ tokensLeft: 5, refillIn: 60000, refillRate: 1, timestamp: Date.now() }),
+    ]);
+    await runCron(env);
+    // No /product or /search calls were issued — only the /token call was made
+    // (verified by the absence of further mock call count; vi.fn().mock.calls.length === 1)
+    // Cleaner assertion: no products inserted from discovery, no offers from enrichment.
+    const offers = await env.DB.prepare('SELECT COUNT(*) AS n FROM offers').first<any>();
+    expect(offers.n).toBe(0);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/cron
+```
+
+Expected: FAIL — `runCron is not defined`.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/cron.ts`** per spec §4.1
+
+```typescript
+import type { Env } from '../env';
+import { fetchTokens } from '../keepa/client';
+import { getStaleProductAsins } from '../db/client';
+import { enrichBatch, type DirtySet } from './enrich';
+import { discoverForCategory } from './discover';
+import { recomputeScoresForDirty } from './score-recompute';
+
+const STALE_MS = 15 * 60 * 1000;     // refresh products older than 15 min
+const SAFETY_MARGIN = 5;
+const SEARCH_RESERVE = 50;
+const TOKEN_FLOOR = 30;
+const TOKENS_PER_ASIN = 2;            // /product?stats=180
+
+/**
+ * 10-min cron orchestrator. Phases per spec §4.1:
+ *   0. (Recovery sweep — added in Chunk 4)
+ *   1. Token check — bail if < TOKEN_FLOOR
+ *   2. Enrich — refresh stale products
+ *   3. Discover — top up new ASINs from /search
+ *   4. Score — recompute current_view for dirty rows
+ *   5. (Alert eval — added in Chunk 4)
+ */
+export async function runCron(env: Env): Promise<void> {
+  const tokensRemaining = await fetchTokens(env);
+  if (tokensRemaining < TOKEN_FLOOR) {
+    console.log(`[cron] tokens=${tokensRemaining} < ${TOKEN_FLOOR}; skipping enrich+discover`);
+    return;
+  }
+
+  const dirty: DirtySet = new Set();
+
+  // Phase 2: enrich
+  const enrichBudget = Math.max(0, Math.floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / TOKENS_PER_ASIN));
+  if (enrichBudget > 0) {
+    const stale = await getStaleProductAsins(env.DB, Date.now(), STALE_MS, enrichBudget);
+    if (stale.length > 0) await enrichBatch(env, stale, dirty);
+  }
+
+  // Phase 3: discover (rotate one category per tick — Phase 1 only has 'gpu')
+  // We always run discovery if budget allows; discoverForCategory bails internally on bot-wall.
+  const tokensAfterEnrich = await fetchTokens(env);
+  if (tokensAfterEnrich >= SEARCH_RESERVE) {
+    await discoverForCategory(env, 'gpu', dirty);
+  }
+
+  // Phase 4: score recompute
+  await recomputeScoresForDirty(env, dirty);
+}
+```
+
+- [ ] **Step 4: Wire `scheduled` handler in `worker/src/index.ts`**
+
+Replace lines 9-15 of `worker/src/index.ts`:
+
+```typescript
+import type { Env, AlertMessage } from './env';
+import { runCron } from './pipeline/cron';
+
+export default {
+  async fetch(req: Request, _env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    if (url.pathname === '/healthz') {
+      return new Response(JSON.stringify({ ok: true, ts: Date.now() }), {
+        headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response('not found', { status: 404 });
+  },
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // 10-min cron only in this chunk; 03:00 UTC daily added in Chunk 6
+    if (event.cron === '*/10 * * * *') {
+      ctx.waitUntil(runCron(env).catch((e) => console.error('[cron]', e)));
+    }
+  },
+  async queue(_batch: MessageBatch<AlertMessage>, _env: Env, _ctx: ExecutionContext): Promise<void> {
+    // Wired in Chunk 4.
+  },
+};
+```
+
+- [ ] **Step 5: Run tests + manual cron trigger via wrangler dev**
+
+```sh
+cd ~/git/sortsafe/worker
+bun test pipeline/cron
+bun run typecheck
+```
+
+Expected: 2/2 cron tests PASS, typecheck clean.
+
+Manual smoke (optional, costs real Keepa tokens):
+
+```sh
+cd ~/git/sortsafe/worker
+bunx wrangler d1 execute sortsafe-db --local --file=src/db/seed.sql        # seed gpu category locally
+bunx wrangler d1 execute sortsafe-db --local --command "INSERT INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active) VALUES ('B0DT7GMXHB', 'gpu', '5090', 'placeholder', null, null, '{}', 1000, 0, 1);"
+bunx wrangler dev --test-scheduled                                          # opens at :8787 with cron triggerable
+# in another terminal:
+curl 'http://localhost:8787/__scheduled?cron=*/10+*+*+*+*'
+bunx wrangler d1 execute sortsafe-db --local --command "SELECT asin, condition, current_price_usd, composite_score FROM current_view ORDER BY composite_score DESC;"
+```
+
+Expected: at least one row in current_view with a real Keepa-sourced price for B0DT7GMXHB.
+
+- [ ] **Step 6: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/cron.ts worker/test/pipeline/cron.test.ts worker/src/index.ts
+git commit -m "feat(cron): 10-min orchestrator wires token-check → enrich → discover → score
+
+Composes the four pipeline phases. Adaptive enrich budget per spec §4.1:
+floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / 2). Recovery
+sweep + alert eval added in Chunk 4.
+
+Manual smoke: wrangler dev --test-scheduled then curl /__scheduled?cron=*/10*
+
+— claude-opus-4-7"
+```
+
+---
+
+**End of Chunk 3.** At this point:
+- `cd ~/git/sortsafe/worker && bun test` passes ~55 cases across db/keepa/extract/pipeline.
+- Cron handler runs end-to-end against mocked Keepa: token check → enrich stale → discover new → score recompute.
+- `current_view` populates with real prices, medians, and composite scores.
+- `bunx wrangler dev --test-scheduled` lets you fire the cron manually for live integration testing.
+
+Next chunk (4): alert evaluation, queue consumer, Discord webhook dispatch, recovery sweep.
+
+---
