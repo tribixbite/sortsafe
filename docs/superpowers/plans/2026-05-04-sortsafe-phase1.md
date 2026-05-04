@@ -4186,15 +4186,15 @@ export async function proxyAmazon(env: Env, req: Request): Promise<Response> {
   });
   const body = await upstream.text();
 
-  // Tag bot-wall responses so the caller knows not to parse them as content
+  // Tag bot-wall responses so the caller knows not to parse them as content.
+  // Header is only set when reason !== 'ok' so its presence agrees with the
+  // ae.botWallHit emit condition added in Chunk 6 Task 21.
   const reason = detectBotWall(body);
-  return new Response(body, {
-    status: upstream.status,
-    headers: {
-      'content-type': upstream.headers.get('content-type') ?? 'text/html; charset=utf-8',
-      'x-sortsafe-bot-wall': reason,
-    },
-  });
+  const headers: Record<string, string> = {
+    'content-type': upstream.headers.get('content-type') ?? 'text/html; charset=utf-8',
+  };
+  if (reason !== 'ok') headers['x-sortsafe-bot-wall'] = reason;
+  return new Response(body, { status: upstream.status, headers });
 }
 ```
 
@@ -4514,16 +4514,33 @@ ae.alertDispatch(env, row.channel, 'permanent-fail', Date.now() - t0);
 
 - [ ] **Step 5: Wire `ae.cronRun` in `worker/src/pipeline/cron.ts` and `cron-daily.ts`**
 
+In `runCron` (already tracks `asinsEnriched`):
+
 ```typescript
-// In runCron:
-const t0 = Date.now();
-let asinsEnriched = 0;       // already tracked
-let alertsDispatched = 0;     // count enqueueIds.length across rules
-// ... at end:
-ae.cronRun(env, '10m', Date.now() - t0, asinsEnriched, alertsDispatched);
+import { ae } from '../lib/analytics';
+
+export async function runCron(env: Env): Promise<void> {
+  const t0 = Date.now();
+  // ... existing recovery → token check → enrich → discover → score → alert eval ...
+  // Phase 5 returns void per Chunk 4 Task 14; we don't track per-tick alert count here
+  // (it's emitted per-channel by ae.alertDispatch in the queue consumer).
+  ae.cronRun(env, '10m', Date.now() - t0, asinsEnriched, 0);
+}
 ```
 
-`alertsDispatched` requires `evaluateAndEnqueueAlerts` to return its count — adjust that signature to `Promise<number>` and propagate.
+In `runDailyCron` add the same closing call so we can chart daily-cron latency:
+
+```typescript
+import { ae } from '../lib/analytics';
+
+export async function runDailyCron(env: Env): Promise<void> {
+  const t0 = Date.now();
+  // ... existing prune + backup steps ...
+  ae.cronRun(env, 'daily', Date.now() - t0, 0, 0);
+}
+```
+
+We deliberately pass `alertsDispatched = 0` from `runCron` rather than refactoring `evaluateAndEnqueueAlerts` to return a count. Per-channel dispatch counts are already covered by `ae.alertDispatch` events in the queue consumer (Chunk 4 Task 15) — querying AE for `blobs.0 = 'alert_dispatch'` over a time window gives the equivalent metric. Adding a return value would force test rewrites in alert-eval.test.ts (6 cases) for no new information.
 
 - [ ] **Step 6: Run all tests + typecheck**
 
@@ -4583,13 +4600,16 @@ This chunk gets the SPA reading from the new Worker API instead of the static se
  * names. The Worker's `pct_below_median_30d`, `composite_score`, etc. fields
  * become available too — UI in this chunk doesn't render them yet (Phase 2).
  */
-import type { GpuOffer, GpuProduct } from './types';
+import type { GpuModel, GpuOffer, GpuProduct } from './types';
 
 export interface ApiSeed {
   offers: GpuOffer[];
   products: GpuProduct[];
   generated_at: number;
 }
+
+const TRACKED_MODELS = new Set<GpuModel>(['3090', '4090', '5090']);
+const isTrackedModel = (s: unknown): s is GpuModel => typeof s === 'string' && TRACKED_MODELS.has(s as GpuModel);
 
 export async function fetchFromApi(apiBase: string): Promise<ApiSeed | null> {
   const url = `${apiBase.replace(/\/$/, '')}/v1/offers?cat=gpu`;
@@ -4598,11 +4618,13 @@ export async function fetchFromApi(apiBase: string): Promise<ApiSeed | null> {
   catch (e) { console.warn('[hydrateFromApi] fetch failed:', e); return null; }
   if (!res.ok) { console.warn(`[hydrateFromApi] HTTP ${res.status}`); return null; }
   const body = await res.json() as { offers: any[]; generated_at: number };
-  // The Worker returns combined offer+product info per row; split into the two arrays
-  // the SPA's IDB layer expects.
+  // The Worker returns combined offer+product info per row; split into the two
+  // arrays the SPA's IDB layer expects. Skip any row whose model isn't a
+  // tracked GpuModel — defensive against the Worker's wider string type.
   const offers: GpuOffer[] = [];
   const productsByAsin = new Map<string, GpuProduct>();
   for (const r of body.offers) {
+    if (!isTrackedModel(r.model)) continue;
     offers.push({
       offer_id: r.offer_id,
       asin: r.asin,
@@ -4638,27 +4660,52 @@ export async function fetchFromApi(apiBase: string): Promise<ApiSeed | null> {
 
 - [ ] **Step 2: Update `src/lib/gpus/db.ts:hydrateFromSeed`** to prefer the API when configured
 
-Replace the body of `hydrateFromSeed`:
+Replace the entire `hydrateFromSeed` function (full body — no placeholders; the per-ASIN delete loop must remain or the prior fix in commit `34832ba` regresses). Add the import at the top of the file too:
 
 ```typescript
 import { fetchFromApi } from './api';
 
-const API_BASE = (typeof window !== 'undefined' ? (window as any).__SORTSAFE_API_BASE : null) ?? import.meta.env?.VITE_API_BASE ?? null;
+// Resolved at module load. Set VITE_API_BASE in .env (or .env.production) to
+// route hydration through the cloud Worker. Empty/undefined → local seed fallback.
+const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? null;
 
 export async function hydrateFromSeed(seedUrl = '/gpus-seed.json'): Promise<{ inserted: number; deleted: number; generatedAt: number | null } | null> {
-  // Phase 1: prefer cloud API if configured. Fall back to local seed file
-  // (used only by the local dev SPA before Phase 1 deploy completes).
+  // Prefer cloud API if configured; fall back to the in-repo seed file
+  // (used by the local dev SPA before Phase 1 deploy completes).
   const apiSeed = API_BASE ? await fetchFromApi(API_BASE) : null;
-  const seed = apiSeed ?? await fetchLocalSeed(seedUrl);
+  let seed: { offers?: GpuOffer[]; products?: GpuProduct[]; generated_at?: number } | null = apiSeed;
+  if (!seed) {
+    let res: Response;
+    try { res = await fetch(seedUrl, { cache: 'no-store' }); } catch { return null; }
+    if (!res.ok) return null;
+    seed = await res.json();
+  }
   if (!seed?.offers?.length) return null;
 
   const seedAsins = new Set(seed.offers.map((o) => o.asin));
   for (const p of seed.products ?? []) seedAsins.add(p.asin);
 
+  // Drop existing IDB offers for any ASIN the seed covers so stale listings vanish.
   let deleted = 0;
   if (seedAsins.size > 0) {
-    // ... existing per-ASIN delete loop unchanged
+    const t = await tx(['offers'], 'readwrite');
+    const idx = t.objectStore('offers').index('asin');
+    await new Promise<void>((resolve, reject) => {
+      let pending = seedAsins.size;
+      if (pending === 0) return resolve();
+      for (const asin of seedAsins) {
+        const req = idx.openCursor(IDBKeyRange.only(asin));
+        req.onsuccess = () => {
+          const cur = req.result;
+          if (cur) { cur.delete(); deleted++; cur.continue(); }
+          else if (--pending === 0) resolve();
+        };
+        req.onerror = () => reject(req.error);
+      }
+    });
+    await done(t);
   }
+
   await putOffers(seed.offers);
   if (seed.products) {
     const t = await tx(['products'], 'readwrite');
@@ -4666,13 +4713,6 @@ export async function hydrateFromSeed(seedUrl = '/gpus-seed.json'): Promise<{ in
     await done(t);
   }
   return { inserted: seed.offers.length, deleted, generatedAt: seed.generated_at ?? null };
-}
-
-async function fetchLocalSeed(url: string): Promise<any | null> {
-  let res: Response;
-  try { res = await fetch(url, { cache: 'no-store' }); } catch { return null; }
-  if (!res.ok) return null;
-  return await res.json();
 }
 ```
 
@@ -4791,14 +4831,33 @@ bunx wrangler deploy
 # Note the deployed URL: e.g. https://sortsafe-api.<your-sub>.workers.dev
 ```
 
-- [ ] **Step 3: Seed the discord_config row in production D1**
+- [ ] **Step 3: Apply schema + seed to production D1**
 
 ```sh
+cd ~/git/sortsafe/worker
+# Schema (idempotent — already applied if you did Chunk 1 Task 2 Step 6, fine to re-run)
+bunx wrangler d1 migrations apply sortsafe-db --remote
+# Seed: gpu category + system user + Phase-1 alert rule (rule_id = '01PHASE1ALERTRULEFORDISCORD')
+# This row is what makes the Phase-1 Discord alert fire — without it, cron has nothing to evaluate.
+bunx wrangler d1 execute sortsafe-db --remote --file=src/db/seed.sql
+# Discord webhook config (a one-time row, not in seed.sql because the URL is environment-specific)
 WEBHOOK="<paste-webhook-url>"
 bunx wrangler d1 execute sortsafe-db --remote --command "INSERT OR REPLACE INTO discord_config (id, webhook_url, enabled, updated_at) VALUES (1, '$WEBHOOK', 1, unixepoch()*1000);"
+# Verify
+bunx wrangler d1 execute sortsafe-db --remote --command "SELECT rule_id, scope_value, metric, threshold FROM alert_rules;"
+bunx wrangler d1 execute sortsafe-db --remote --command "SELECT id, enabled FROM discord_config;"
 ```
 
-(Once the row exists, the `DISCORD_WEBHOOK_URL` secret is no longer load-bearing — leave it as fallback or `wrangler secret delete` it.)
+Expected: one alert rule row (`01PHASE1ALERTRULEFORDISCORD / gpu / pct_below_median_30d / 15.0`) and one discord_config row. Once both exist, the `DISCORD_WEBHOOK_URL` secret is no longer load-bearing — leave it as fallback or `wrangler secret delete DISCORD_WEBHOOK_URL`.
+
+If the webhook URL contains characters bash would interpret oddly (single quotes, backticks), use the heredoc form instead:
+```sh
+bunx wrangler d1 execute sortsafe-db --remote --command "$(cat <<EOF
+INSERT OR REPLACE INTO discord_config (id, webhook_url, enabled, updated_at)
+VALUES (1, '$WEBHOOK', 1, unixepoch()*1000);
+EOF
+)"
+```
 
 - [ ] **Step 4: Backfill from existing seed**
 
@@ -4809,13 +4868,19 @@ API_BASE=https://sortsafe-api.<sub>.workers.dev SCRAPE_HMAC=<the-hmac-you-set> b
 
 Expected: HTTP 200 with `{products_imported: 32, offers_imported: 47}` (or whatever the current seed has).
 
-- [ ] **Step 5: Manual cron trigger**
+- [ ] **Step 5: Manual cron trigger** (the `/__scheduled` route is a `wrangler dev`-only debug helper and is NOT exposed on deployed Workers — use the wrangler CLI instead, or wait for the natural 10-min tick)
 
 ```sh
-curl -X POST 'https://sortsafe-api.<sub>.workers.dev/__scheduled?cron=*/10+*+*+*+*'
+# Option A: trigger via wrangler CLI (preferred — fires the deployed Worker's
+# scheduled handler directly without waiting for the next 10-min slot)
+bunx wrangler triggers cron run sortsafe-api --cron='*/10 * * * *'
+
+# Option B: tail logs while you wait for the natural cron firing
+bunx wrangler tail sortsafe-api --format=pretty
+# (in a separate shell, just wait — within 10 min the cron will fire)
 ```
 
-Wait ~30s, then verify D1 has fresh snapshots:
+Wait ~30s after triggering, then verify D1 has fresh snapshots:
 
 ```sh
 bunx wrangler d1 execute sortsafe-db --remote --command "SELECT asin, condition, price_usd, taken_at FROM snapshots ORDER BY taken_at DESC LIMIT 10;"
