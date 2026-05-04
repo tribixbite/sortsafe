@@ -2682,3 +2682,870 @@ Manual smoke: wrangler dev --test-scheduled then curl '/__scheduled?cron=*/10+*+
 Next chunk (4): alert evaluation, queue consumer, Discord webhook dispatch, recovery sweep.
 
 ---
+
+## Chunk 4: Alert evaluation + queue consumer + Discord dispatch + recovery sweep
+
+This chunk closes the cron loop with alert dispatch. After this chunk: a cron tick that finds a 5090 used at ≥15% below 30-day median enqueues a Discord delivery; the queue consumer drains it and posts to the configured webhook. Recovery sweep re-enqueues any orphaned deliveries from a prior failed cron.
+
+### Task 13: Recovery sweep (cron step 0)
+
+**Files:**
+- Create: `worker/src/pipeline/recovery.ts`
+- Create: `worker/test/pipeline/recovery.test.ts`
+
+- [ ] **Step 1: Write the failing test** at `worker/test/pipeline/recovery.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { recoverPendingDeliveries } from '../../src/pipeline/recovery';
+
+const seedDelivery = (id: string, enqueuedAt: number, deliveredAt: number | null) => env.DB.prepare(
+  `INSERT INTO alert_deliveries (delivery_id, rule_id, offer_id, channel, enqueued_at, delivered_at, payload_hash)
+   VALUES (?, 'R1', 'B0X__used-good__', 'discord', ?, ?, 'h1')`
+).bind(id, enqueuedAt, deliveredAt).run();
+
+describe('recoverPendingDeliveries', () => {
+  it('re-enqueues deliveries with delivered_at IS NULL AND enqueued_at < now-5min', async () => {
+    const now = Date.now();
+    await seedDelivery('D_OLD_PENDING', now - 10 * 60 * 1000, null);   // 10 min old, pending → recover
+    await seedDelivery('D_RECENT_PENDING', now - 60 * 1000, null);     // 1 min old → too fresh, leave to original cron
+    await seedDelivery('D_DELIVERED', now - 10 * 60 * 1000, now - 9 * 60 * 1000);  // already delivered → skip
+    const sent: string[] = [];
+    const fakeQueue = { send: async (m: { delivery_id: string }) => { sent.push(m.delivery_id); } } as any;
+    const count = await recoverPendingDeliveries(env.DB, fakeQueue, now);
+    expect(count).toBe(1);
+    expect(sent).toEqual(['D_OLD_PENDING']);
+  });
+
+  it('returns 0 when no pending deliveries exist', async () => {
+    const sent: string[] = [];
+    const fakeQueue = { send: async (m: any) => { sent.push(m.delivery_id); } } as any;
+    expect(await recoverPendingDeliveries(env.DB, fakeQueue, Date.now())).toBe(0);
+    expect(sent).toEqual([]);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/recovery
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/recovery.ts`**
+
+```typescript
+import type { AlertMessage } from '../env';
+
+const STUCK_THRESHOLD_MS = 5 * 60 * 1000;
+
+/**
+ * Cron step 0: re-enqueue any alert_deliveries rows that were inserted
+ * by a prior cron but whose CF Queue send failed (delivered_at still NULL,
+ * older than 5 min so we don't race the consumer that's actively processing
+ * a fresh batch).
+ */
+export async function recoverPendingDeliveries(db: D1Database, queue: Queue<AlertMessage>, now: number): Promise<number> {
+  const cutoff = now - STUCK_THRESHOLD_MS;
+  const pending = await db.prepare(
+    `SELECT delivery_id FROM alert_deliveries WHERE delivered_at IS NULL AND enqueued_at < ?`
+  ).bind(cutoff).all<{ delivery_id: string }>();
+  for (const row of pending.results) {
+    await queue.send({ delivery_id: row.delivery_id });
+  }
+  return pending.results.length;
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/recovery
+```
+
+Expected: 2/2 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/recovery.ts worker/test/pipeline/recovery.test.ts
+git commit -m "feat(pipeline): cron step 0 — re-enqueue orphaned alert deliveries
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 14: Alert eval (cron step 5)
+
+**Files:**
+- Create: `worker/src/pipeline/alert-eval.ts`
+- Create: `worker/test/pipeline/alert-eval.test.ts`
+
+- [ ] **Step 1: Write the failing test**
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { env } from 'cloudflare:test';
+import { evaluateAndEnqueueAlerts } from '../../src/pipeline/alert-eval';
+
+const seedSystemUserAndRule = async (rule: {
+  rule_id: string; metric: string; threshold: number;
+  conditions: string[]; channels: string[]; cooldown_s?: number;
+  last_fired_at?: number | null;
+}) => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO users (user_id, pin_hash, pin_prefix, created_at, last_seen) VALUES ('sys', 'h', 'p', 0, 0)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '[]', '{"5090":1999}', 1)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT INTO alert_rules (rule_id, user_id, scope, scope_value, metric, threshold, conditions, channels, cooldown_s, active, created_at, last_fired_at)
+     VALUES (?, 'sys', 'category', 'gpu', ?, ?, ?, ?, ?, 1, 0, ?)`
+  ).bind(rule.rule_id, rule.metric, rule.threshold, JSON.stringify(rule.conditions), JSON.stringify(rule.channels), rule.cooldown_s ?? 1800, rule.last_fired_at ?? null).run();
+};
+
+const seedProductOfferAndCurrentView = async (asin: string, condition: string, currentPrice: number, pctBelowMedian: number) => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+     VALUES (?, 'gpu', '5090', 'GIGABYTE GeForce RTX 5090 32G', 'GIGABYTE', null, '{}', 1000, 1000, 1)`
+  ).bind(asin).run();
+  const offerId = `${asin}__${condition}__`;
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO offers (offer_id, asin, condition, price_usd, source, first_seen, last_seen, available)
+     VALUES (?, ?, ?, ?, 'keepa', 1000, ?, 1)`
+  ).bind(offerId, asin, condition, currentPrice, Date.now()).run();
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO current_view (asin, condition, current_price_usd, best_offer_id, pct_below_median_30d, composite_score, recomputed_at)
+     VALUES (?, ?, ?, ?, ?, 50, ?)`
+  ).bind(asin, condition, currentPrice, offerId, pctBelowMedian, Date.now()).run();
+};
+
+describe('evaluateAndEnqueueAlerts', () => {
+  it('inserts a discord delivery for a rule whose threshold is met', async () => {
+    await seedSystemUserAndRule({
+      rule_id: 'R_PCT15', metric: 'pct_below_median_30d', threshold: 15,
+      conditions: ['used-good'], channels: ['discord'],
+    });
+    await seedProductOfferAndCurrentView('B0ALERT01', 'used-good', 1500, 20);  // 20% below median ≥ 15 → fire
+    const sent: string[] = [];
+    const queue = { send: async (m: { delivery_id: string }) => { sent.push(m.delivery_id); } } as any;
+    await evaluateAndEnqueueAlerts(env, queue);
+    expect(sent.length).toBe(1);
+    const d = await env.DB.prepare('SELECT * FROM alert_deliveries WHERE rule_id = ?').bind('R_PCT15').first<any>();
+    expect(d.channel).toBe('discord');
+    expect(d.offer_id).toBe('B0ALERT01__used-good__');
+  });
+
+  it('skips a rule whose threshold is NOT met', async () => {
+    await seedSystemUserAndRule({
+      rule_id: 'R_NOFIRE', metric: 'pct_below_median_30d', threshold: 15,
+      conditions: ['used-good'], channels: ['discord'],
+    });
+    await seedProductOfferAndCurrentView('B0NOFIRE01', 'used-good', 1900, 5);   // only 5% below
+    const sent: string[] = [];
+    const queue = { send: async (m: any) => { sent.push(m.delivery_id); } } as any;
+    await evaluateAndEnqueueAlerts(env, queue);
+    expect(sent).toEqual([]);
+    const d = await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_deliveries').first<any>();
+    expect(d.n).toBe(0);
+  });
+
+  it('respects cooldown — does not refire within cooldown_s', async () => {
+    await seedSystemUserAndRule({
+      rule_id: 'R_COOL', metric: 'pct_below_median_30d', threshold: 15,
+      conditions: ['used-good'], channels: ['discord'],
+      cooldown_s: 1800, last_fired_at: Date.now() - 60_000,   // fired 1 min ago, cooldown 30 min
+    });
+    await seedProductOfferAndCurrentView('B0COOL01', 'used-good', 1500, 20);
+    const sent: string[] = [];
+    const queue = { send: async (m: any) => { sent.push(m.delivery_id); } } as any;
+    await evaluateAndEnqueueAlerts(env, queue);
+    expect(sent).toEqual([]);
+  });
+
+  it('global-dedupes Discord — one delivery per (offer_id, threshold_bucket) across all rules', async () => {
+    // Two rules, both matching the same offer with discord channel
+    await seedSystemUserAndRule({ rule_id: 'R_A', metric: 'pct_below_median_30d', threshold: 15, conditions: ['used-good'], channels: ['discord'] });
+    await seedSystemUserAndRule({ rule_id: 'R_B', metric: 'pct_below_median_30d', threshold: 10, conditions: ['used-good'], channels: ['discord'] });
+    await seedProductOfferAndCurrentView('B0DEDUPE01', 'used-good', 1500, 20);  // both match
+    const sent: string[] = [];
+    const queue = { send: async (m: any) => { sent.push(m.delivery_id); } } as any;
+    await evaluateAndEnqueueAlerts(env, queue);
+    const discordRows = await env.DB.prepare('SELECT COUNT(*) AS n FROM alert_deliveries WHERE channel = ?').bind('discord').first<any>();
+    expect(discordRows.n).toBe(1);              // global dedupe — only one Discord row for this offer
+  });
+
+  it('updates last_fired_at after successful enqueue', async () => {
+    await seedSystemUserAndRule({
+      rule_id: 'R_LAST', metric: 'pct_below_median_30d', threshold: 15,
+      conditions: ['used-good'], channels: ['discord'],
+    });
+    await seedProductOfferAndCurrentView('B0LAST01', 'used-good', 1500, 20);
+    const queue = { send: async () => { /* succeeds */ } } as any;
+    await evaluateAndEnqueueAlerts(env, queue);
+    const r = await env.DB.prepare('SELECT last_fired_at FROM alert_rules WHERE rule_id = ?').bind('R_LAST').first<any>();
+    expect(r.last_fired_at).toBeGreaterThan(0);
+  });
+
+  it('does NOT update last_fired_at when queue.send throws', async () => {
+    await seedSystemUserAndRule({
+      rule_id: 'R_FAIL', metric: 'pct_below_median_30d', threshold: 15,
+      conditions: ['used-good'], channels: ['discord'],
+    });
+    await seedProductOfferAndCurrentView('B0FAIL01', 'used-good', 1500, 20);
+    const queue = { send: async () => { throw new Error('queue down'); } } as any;
+    await evaluateAndEnqueueAlerts(env, queue).catch(() => {});
+    const r = await env.DB.prepare('SELECT last_fired_at FROM alert_rules WHERE rule_id = ?').bind('R_FAIL').first<any>();
+    expect(r.last_fired_at).toBeNull();
+    // Delivery row stays in DB with delivered_at=NULL — recovery sweep picks it up next tick
+    const d = await env.DB.prepare('SELECT delivered_at FROM alert_deliveries WHERE rule_id = ?').bind('R_FAIL').first<any>();
+    expect(d.delivered_at).toBeNull();
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/alert-eval
+```
+
+Expected: FAIL — module not found.
+
+- [ ] **Step 3: Implement `worker/src/pipeline/alert-eval.ts`** per spec §4.1 step 5
+
+```typescript
+import type { Env, AlertMessage } from '../env';
+import type { AlertChannel, AlertMetric, AlertRuleRow, GpuCondition } from '../db/types';
+import { getActiveAlertRules } from '../db/client';
+import { ulid } from 'ulid';
+
+const THRESHOLD_BUCKET_USD = 25;     // payload_hash dedupe granularity per spec §4.1 step 5c
+
+interface CurrentRow {
+  asin: string;
+  condition: GpuCondition;
+  current_price_usd: number;
+  best_offer_id: string;
+  pct_below_median_30d: number | null;
+  pct_below_median_90d: number | null;
+  pct_off_msrp: number | null;
+  composite_score: number;
+}
+
+const metricValue = (row: CurrentRow, metric: AlertMetric): number | null => {
+  switch (metric) {
+    case 'price_floor': return row.current_price_usd;
+    case 'pct_below_median_30d': return row.pct_below_median_30d;
+    case 'pct_below_median_90d': return row.pct_below_median_90d;
+    case 'pct_off_msrp': return row.pct_off_msrp;
+    case 'composite_score': return row.composite_score;
+  }
+};
+
+const matches = (value: number | null, metric: AlertMetric, threshold: number): boolean => {
+  if (value == null) return false;
+  // price_floor fires when current ≤ threshold; everything else is "≥ threshold"
+  return metric === 'price_floor' ? value <= threshold : value >= threshold;
+};
+
+async function selectCurrentRowsForRule(env: Env, rule: AlertRuleRow): Promise<CurrentRow[]> {
+  const conditions = JSON.parse(rule.conditions) as GpuCondition[];
+  const placeholders = conditions.map(() => '?').join(',');
+  if (rule.scope === 'asin') {
+    const r = await env.DB.prepare(
+      `SELECT cv.asin, cv.condition, cv.current_price_usd, cv.best_offer_id,
+              cv.pct_below_median_30d, cv.pct_below_median_90d, cv.pct_off_msrp, cv.composite_score
+       FROM current_view cv
+       WHERE cv.asin = ? AND cv.condition IN (${placeholders})`
+    ).bind(rule.scope_value, ...conditions).all<CurrentRow>();
+    return r.results;
+  }
+  if (rule.scope === 'category') {
+    const r = await env.DB.prepare(
+      `SELECT cv.asin, cv.condition, cv.current_price_usd, cv.best_offer_id,
+              cv.pct_below_median_30d, cv.pct_below_median_90d, cv.pct_off_msrp, cv.composite_score
+       FROM current_view cv
+       JOIN products p ON p.asin = cv.asin
+       WHERE p.category_id = ? AND cv.condition IN (${placeholders})`
+    ).bind(rule.scope_value, ...conditions).all<CurrentRow>();
+    return r.results;
+  }
+  // 'watcher' scope is Phase 3 — no-op in Phase 1
+  return [];
+}
+
+const buildPayloadHash = async (ruleId: string, asin: string, condition: string, currentPrice: number): Promise<string> => {
+  const bucket = Math.floor(currentPrice / THRESHOLD_BUCKET_USD) * THRESHOLD_BUCKET_USD;
+  const data = new TextEncoder().encode(`${ruleId}|${asin}|${condition}|${bucket}`);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+};
+
+/**
+ * Cron step 5. For every active rule whose cooldown has elapsed, find matching
+ * current_view rows, build delivery rows (deduping discord channel globally
+ * across all rules in this tick), enqueue to CF Queue, and update last_fired_at
+ * ONLY on successful enqueue.
+ */
+export async function evaluateAndEnqueueAlerts(env: Env, queue: Queue<AlertMessage> = env.ALERTS): Promise<void> {
+  const now = Date.now();
+  const rules = await getActiveAlertRules(env.DB, now);
+  if (rules.length === 0) return;
+
+  // Global Discord dedupe set: 'discord|' || offer_id || '|' || threshold_bucket
+  const globalDiscordSeen = new Set<string>();
+
+  for (const rule of rules) {
+    const channels = JSON.parse(rule.channels) as AlertChannel[];
+    const matching = await selectCurrentRowsForRule(env, rule);
+    const enqueueIds: string[] = [];
+
+    for (const row of matching) {
+      const value = metricValue(row, rule.metric);
+      if (!matches(value, rule.metric, rule.threshold)) continue;
+
+      const payloadHash = await buildPayloadHash(rule.rule_id, row.asin, row.condition, row.current_price_usd);
+      const bucket = Math.floor(row.current_price_usd / THRESHOLD_BUCKET_USD) * THRESHOLD_BUCKET_USD;
+
+      for (const channel of channels) {
+        if (channel === 'discord') {
+          const dedupeKey = `discord|${row.best_offer_id}|${bucket}`;
+          if (globalDiscordSeen.has(dedupeKey)) continue;
+          globalDiscordSeen.add(dedupeKey);
+        }
+
+        // Cooldown-window dedupe via NOT EXISTS subquery (per spec §4.1 step 5c)
+        const deliveryId = ulid();
+        const result = await env.DB.prepare(
+          `INSERT INTO alert_deliveries (delivery_id, rule_id, offer_id, channel, payload_hash, enqueued_at)
+           SELECT ?, ?, ?, ?, ?, ?
+           WHERE NOT EXISTS (
+             SELECT 1 FROM alert_deliveries
+             WHERE rule_id = ?2 AND payload_hash = ?5
+               AND enqueued_at > ?7
+           )`
+        ).bind(
+          deliveryId, rule.rule_id, row.best_offer_id, channel, payloadHash, now, now - rule.cooldown_s * 1000
+        ).run();
+        if (result.meta.changes > 0) enqueueIds.push(deliveryId);
+      }
+    }
+
+    if (enqueueIds.length === 0) continue;
+
+    // Atomic enqueue+last_fired_at: throw on enqueue error so last_fired_at stays untouched
+    try {
+      for (const id of enqueueIds) await queue.send({ delivery_id: id });
+      await env.DB.prepare(`UPDATE alert_rules SET last_fired_at = ? WHERE rule_id = ?`).bind(now, rule.rule_id).run();
+    } catch (e) {
+      console.error(`[alert-eval] enqueue failed for rule ${rule.rule_id}:`, e);
+      // Recovery sweep in cron step 0 will re-enqueue these rows next tick.
+      throw e;
+    }
+  }
+}
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/alert-eval
+```
+
+Expected: 6/6 PASS.
+
+- [ ] **Step 5: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/alert-eval.ts worker/test/pipeline/alert-eval.test.ts
+git commit -m "feat(pipeline): alert eval — global Discord dedupe, cooldown-window NOT EXISTS, atomic enqueue+last_fired_at
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 15: Discord webhook dispatch + queue consumer
+
+**Files:**
+- Create: `worker/src/queue/discord.ts`
+- Create: `worker/src/queue/consumer.ts`
+- Create: `worker/test/queue/discord.test.ts`
+- Create: `worker/test/queue/consumer.test.ts`
+
+- [ ] **Step 1: Write the failing test for the payload builder** at `worker/test/queue/discord.test.ts`
+
+```typescript
+import { describe, it, expect } from 'vitest';
+import { buildDiscordPayload, type DiscordContext } from '../../src/queue/discord';
+
+const ctx: DiscordContext = {
+  asin: 'B0DT7GMXHB',
+  title: 'GIGABYTE GeForce RTX 5090 WINDFORCE OC 32G Graphics Card',
+  thumbnail_url: 'https://m.media-amazon.com/images/I/abc.jpg',
+  model: '5090',
+  condition: 'used-good',
+  current_price_usd: 1500,
+  median_30d: 1800,
+  msrp_baseline: 1999,
+  pct_below_median_30d: 16.67,
+  composite_score: 72,
+};
+
+describe('buildDiscordPayload', () => {
+  it('produces a webhook body with embed, title, price, and Amazon link', () => {
+    const body = buildDiscordPayload(ctx);
+    expect(body.embeds).toHaveLength(1);
+    const e = body.embeds[0];
+    expect(e.url).toContain('amazon.com/dp/B0DT7GMXHB');
+    expect(e.title).toContain('5090');
+    expect(e.thumbnail?.url).toBe(ctx.thumbnail_url);
+    expect(e.fields?.find((f) => f.name === 'Price')?.value).toContain('1,500');
+    expect(e.fields?.find((f) => f.name === 'Condition')?.value).toBe('Used — Good');
+    expect(e.fields?.find((f) => f.name === '30d Median')?.value).toContain('1,800');
+    expect(e.fields?.some((f) => f.name === 'vs Median' && f.value.includes('16.7%'))).toBe(true);
+  });
+
+  it('omits the median field when median_30d is null (brand-new ASIN)', () => {
+    const body = buildDiscordPayload({ ...ctx, median_30d: null, pct_below_median_30d: null });
+    const e = body.embeds[0];
+    expect(e.fields?.some((f) => f.name === '30d Median')).toBe(false);
+  });
+});
+```
+
+- [ ] **Step 2: Implement `worker/src/queue/discord.ts`**
+
+```typescript
+import type { GpuCondition } from '../db/types';
+
+export interface DiscordContext {
+  asin: string;
+  title: string;
+  thumbnail_url: string | null;
+  model: string | null;
+  condition: GpuCondition;
+  current_price_usd: number;
+  median_30d: number | null;
+  msrp_baseline: number | null;
+  pct_below_median_30d: number | null;
+  composite_score: number;
+}
+
+const CONDITION_DISPLAY: Record<GpuCondition, string> = {
+  'new': 'New',
+  'used-like-new': 'Used — Like New',
+  'used-very-good': 'Used — Very Good',
+  'used-good': 'Used — Good',
+  'used-acceptable': 'Used — Acceptable',
+  'refurbished': 'Refurbished',
+  'warehouse': 'Amazon Warehouse',
+  'unknown': 'Unknown',
+};
+
+const fmtUsd = (n: number) => `$${n.toLocaleString('en-US', { maximumFractionDigits: 0 })}`;
+const fmtPct = (n: number) => `${n.toFixed(1)}%`;
+
+interface DiscordEmbedField { name: string; value: string; inline?: boolean; }
+interface DiscordEmbed { title: string; url: string; thumbnail?: { url: string }; color?: number; fields?: DiscordEmbedField[]; timestamp?: string; }
+export interface DiscordWebhookBody { content?: string; embeds: DiscordEmbed[]; }
+
+export function buildDiscordPayload(ctx: DiscordContext): DiscordWebhookBody {
+  const fields: DiscordEmbedField[] = [
+    { name: 'Price', value: fmtUsd(ctx.current_price_usd), inline: true },
+    { name: 'Condition', value: CONDITION_DISPLAY[ctx.condition], inline: true },
+  ];
+  if (ctx.median_30d != null) {
+    fields.push({ name: '30d Median', value: fmtUsd(ctx.median_30d), inline: true });
+  }
+  if (ctx.pct_below_median_30d != null) {
+    fields.push({ name: 'vs Median', value: `−${fmtPct(ctx.pct_below_median_30d)}`, inline: true });
+  }
+  if (ctx.msrp_baseline != null) {
+    fields.push({ name: 'MSRP', value: fmtUsd(ctx.msrp_baseline), inline: true });
+  }
+  fields.push({ name: 'Score', value: ctx.composite_score.toFixed(0), inline: true });
+
+  return {
+    embeds: [{
+      title: `RTX ${ctx.model ?? '?'} — ${ctx.title.slice(0, 200)}`,
+      url: `https://www.amazon.com/dp/${ctx.asin}`,
+      thumbnail: ctx.thumbnail_url ? { url: ctx.thumbnail_url } : undefined,
+      color: 0x4ade80,        // green
+      fields,
+      timestamp: new Date().toISOString(),
+    }],
+  };
+}
+
+/**
+ * POST the webhook body to Discord. Returns true on 2xx, throws on 5xx
+ * (caller decides whether to mark as permanent failure or retry).
+ *
+ * Discord webhook URL is read from D1 first; if missing falls back to the
+ * DISCORD_WEBHOOK_URL secret (cold-start path per spec §9.2).
+ */
+export async function postToDiscord(webhookUrl: string, body: DiscordWebhookBody): Promise<void> {
+  const r = await fetch(webhookUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (r.status >= 500) throw new Error(`Discord webhook 5xx: ${r.status}`);
+  if (!r.ok && r.status !== 204) {
+    // 4xx is a permanent error (bad webhook URL, malformed payload). Caller
+    // should mark delivered_at with the error string, not retry.
+    throw new Error(`Discord webhook ${r.status}: ${(await r.text()).slice(0, 200)}`);
+  }
+}
+```
+
+- [ ] **Step 3: Run test for the payload builder**
+
+```sh
+cd ~/git/sortsafe/worker && bun test queue/discord
+```
+
+Expected: 2/2 PASS.
+
+- [ ] **Step 4: Write the failing test for the consumer** at `worker/test/queue/consumer.test.ts`
+
+```typescript
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { env } from 'cloudflare:test';
+import { handleAlertBatch } from '../../src/queue/consumer';
+
+const seed = async (deliveryId: string, channel: string) => {
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO categories (category_id, display, search_terms, msrp_baseline, enabled) VALUES ('gpu', 'GPUs', '[]', '{"5090":1999}', 1)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO products (asin, category_id, model, title, brand, thumbnail_url, attrs_json, first_seen, last_refreshed, active)
+     VALUES ('B0CONS01', 'gpu', '5090', 'GIGABYTE GeForce RTX 5090 32G', 'GIGABYTE', 'https://example.com/t.jpg', '{}', 1000, 1000, 1)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO offers (offer_id, asin, condition, price_usd, source, first_seen, last_seen, available)
+     VALUES ('B0CONS01__used-good__', 'B0CONS01', 'used-good', 1500, 'keepa', 1000, 1000, 1)`
+  ).run();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO current_view (asin, condition, current_price_usd, best_offer_id, median_30d, pct_below_median_30d, composite_score, recomputed_at)
+     VALUES ('B0CONS01', 'used-good', 1500, 'B0CONS01__used-good__', 1800, 16.67, 72, ?)`
+  ).bind(Date.now()).run();
+  await env.DB.prepare(
+    `INSERT INTO alert_deliveries (delivery_id, rule_id, offer_id, channel, enqueued_at, payload_hash)
+     VALUES (?, 'R1', 'B0CONS01__used-good__', ?, ?, 'h1')`
+  ).bind(deliveryId, channel, Date.now()).run();
+  await env.DB.prepare(
+    `INSERT OR IGNORE INTO discord_config (id, webhook_url, enabled, updated_at) VALUES (1, 'https://discord.example/webhook/abc', 1, ?)`
+  ).bind(Date.now()).run();
+};
+
+const fakeBatch = (ids: string[]): MessageBatch<{ delivery_id: string }> => ({
+  messages: ids.map((id) => ({
+    id, body: { delivery_id: id }, timestamp: new Date(), attempts: 1,
+    ack: () => {}, retry: () => {},
+  })),
+  queue: 'sortsafe-alerts',
+  ackAll: () => {},
+  retryAll: () => {},
+} as unknown as MessageBatch<{ delivery_id: string }>);
+
+describe('handleAlertBatch', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+
+  it('posts a Discord webhook for a discord delivery and marks delivered_at', async () => {
+    await seed('D_OK01', 'discord');
+    const fetchFn = vi.fn().mockResolvedValue(new Response('', { status: 204 }));
+    vi.stubGlobal('fetch', fetchFn);
+    await handleAlertBatch(env, fakeBatch(['D_OK01']));
+    expect(fetchFn).toHaveBeenCalledTimes(1);
+    expect(fetchFn.mock.calls[0][0]).toBe('https://discord.example/webhook/abc');
+    const r = await env.DB.prepare('SELECT delivered_at, error FROM alert_deliveries WHERE delivery_id = ?').bind('D_OK01').first<any>();
+    expect(r.delivered_at).toBeGreaterThan(0);
+    expect(r.error).toBeNull();
+  });
+
+  it('records error and leaves delivered_at NULL on Discord 5xx (so retry can re-deliver)', async () => {
+    await seed('D_5XX01', 'discord');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('boom', { status: 502 })));
+    await handleAlertBatch(env, fakeBatch(['D_5XX01']));
+    const r = await env.DB.prepare('SELECT delivered_at, error FROM alert_deliveries WHERE delivery_id = ?').bind('D_5XX01').first<any>();
+    expect(r.delivered_at).toBeNull();
+    expect(r.error).toContain('502');
+  });
+
+  it('records error AND marks delivered_at on Discord 4xx (permanent — no retry)', async () => {
+    await seed('D_4XX01', 'discord');
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('bad webhook', { status: 404 })));
+    await handleAlertBatch(env, fakeBatch(['D_4XX01']));
+    const r = await env.DB.prepare('SELECT delivered_at, error FROM alert_deliveries WHERE delivery_id = ?').bind('D_4XX01').first<any>();
+    expect(r.delivered_at).toBeGreaterThan(0);    // marked delivered (won't retry) but error captured for audit
+    expect(r.error).toContain('404');
+  });
+
+  it('skips push and email channels in Phase 1 with a no-op + warning (deferred to Phase 2/3)', async () => {
+    await seed('D_PUSH01', 'push');
+    await handleAlertBatch(env, fakeBatch(['D_PUSH01']));
+    const r = await env.DB.prepare('SELECT delivered_at, error FROM alert_deliveries WHERE delivery_id = ?').bind('D_PUSH01').first<any>();
+    expect(r.delivered_at).toBeGreaterThan(0);
+    expect(r.error).toContain('phase-1-no-op');
+  });
+});
+```
+
+- [ ] **Step 5: Implement `worker/src/queue/consumer.ts`**
+
+```typescript
+import type { Env, AlertMessage } from '../env';
+import type { GpuCondition } from '../db/types';
+import { buildDiscordPayload, postToDiscord, type DiscordContext } from './discord';
+
+interface JoinedDelivery {
+  delivery_id: string;
+  rule_id: string;
+  channel: 'discord' | 'push' | 'email';
+  asin: string;
+  title: string;
+  thumbnail_url: string | null;
+  model: string | null;
+  condition: GpuCondition;
+  current_price_usd: number;
+  median_30d: number | null;
+  msrp_baseline: number | null;
+  pct_below_median_30d: number | null;
+  composite_score: number;
+}
+
+const loadDelivery = (env: Env, id: string) => env.DB.prepare(
+  `SELECT d.delivery_id, d.rule_id, d.channel,
+          o.asin, p.title, p.thumbnail_url, p.model,
+          o.condition,
+          cv.current_price_usd, cv.median_30d, cv.msrp_baseline,
+          cv.pct_below_median_30d, cv.composite_score
+   FROM alert_deliveries d
+   JOIN offers o      ON o.offer_id = d.offer_id
+   JOIN products p    ON p.asin = o.asin
+   JOIN current_view cv ON cv.asin = o.asin AND cv.condition = o.condition
+   WHERE d.delivery_id = ?`
+).bind(id).first<JoinedDelivery>();
+
+const getDiscordWebhookUrl = async (env: Env): Promise<string | null> => {
+  const row = await env.DB.prepare(`SELECT webhook_url, enabled FROM discord_config WHERE id = 1`).first<{ webhook_url: string; enabled: number }>();
+  if (row?.enabled && row.webhook_url) return row.webhook_url;
+  return env.DISCORD_WEBHOOK_URL ?? null;
+};
+
+const markDelivered = (env: Env, id: string, error: string | null) => env.DB.prepare(
+  `UPDATE alert_deliveries SET delivered_at = ?, error = ? WHERE delivery_id = ?`
+).bind(Date.now(), error, id).run();
+
+const markErrorOnly = (env: Env, id: string, error: string) => env.DB.prepare(
+  `UPDATE alert_deliveries SET error = ? WHERE delivery_id = ?`
+).bind(error, id).run();
+
+/**
+ * Process one CF Queue batch. Each message corresponds to one alert_deliveries
+ * row. We dispatch per-channel, mark delivered_at on success or 4xx (4xx is a
+ * permanent error — no value in retrying), leave delivered_at null on 5xx so
+ * Queues' built-in retry policy re-delivers.
+ */
+export async function handleAlertBatch(env: Env, batch: MessageBatch<AlertMessage>): Promise<void> {
+  for (const msg of batch.messages) {
+    const id = msg.body.delivery_id;
+    const row = await loadDelivery(env, id);
+    if (!row) {
+      // The current_view row may have been removed between enqueue and dispatch
+      // (e.g. all offers went unavailable). Mark as delivered with a note.
+      await markDelivered(env, id, 'no current_view at dispatch time');
+      msg.ack();
+      continue;
+    }
+
+    if (row.channel === 'push' || row.channel === 'email') {
+      await markDelivered(env, id, 'phase-1-no-op (push/email arrive in Phase 2/3)');
+      msg.ack();
+      continue;
+    }
+
+    if (row.channel === 'discord') {
+      const url = await getDiscordWebhookUrl(env);
+      if (!url) {
+        await markDelivered(env, id, 'no discord_config and no DISCORD_WEBHOOK_URL secret');
+        msg.ack();
+        continue;
+      }
+      const ctx: DiscordContext = {
+        asin: row.asin, title: row.title, thumbnail_url: row.thumbnail_url, model: row.model,
+        condition: row.condition,
+        current_price_usd: row.current_price_usd,
+        median_30d: row.median_30d,
+        msrp_baseline: row.msrp_baseline,
+        pct_below_median_30d: row.pct_below_median_30d,
+        composite_score: row.composite_score,
+      };
+      try {
+        await postToDiscord(url, buildDiscordPayload(ctx));
+        await markDelivered(env, id, null);
+        msg.ack();
+      } catch (e) {
+        const err = (e as Error).message;
+        if (err.includes(' 5xx:') || err.toLowerCase().includes('network')) {
+          // Transient — record error but leave delivered_at NULL; Queues retries.
+          await markErrorOnly(env, id, err);
+          msg.retry();
+        } else {
+          // Permanent (4xx, malformed). Mark delivered to avoid infinite retry.
+          await markDelivered(env, id, err);
+          msg.ack();
+        }
+      }
+    }
+  }
+}
+```
+
+- [ ] **Step 6: Wire `queue` handler in `worker/src/index.ts`**
+
+Replace the `queue` stub:
+
+```typescript
+import { handleAlertBatch } from './queue/consumer';
+
+// ...inside default export:
+async queue(batch: MessageBatch<AlertMessage>, env: Env, _ctx: ExecutionContext): Promise<void> {
+  await handleAlertBatch(env, batch);
+},
+```
+
+- [ ] **Step 7: Run tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test queue
+```
+
+Expected: 6/6 PASS (2 discord + 4 consumer).
+
+- [ ] **Step 8: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/queue/ worker/test/queue/ worker/src/index.ts
+git commit -m "feat(queue): Discord webhook builder + dispatch + queue consumer with 5xx-retry/4xx-ack semantics
+
+— claude-opus-4-7"
+```
+
+---
+
+### Task 16: Wire alert eval + recovery into cron orchestrator
+
+**Files:**
+- Modify: `worker/src/pipeline/cron.ts` — add steps 0 and 5
+
+- [ ] **Step 1: Update `worker/src/pipeline/cron.ts`** to call recovery + alert eval
+
+Replace the body of `runCron`:
+
+```typescript
+import type { Env } from '../env';
+import { fetchTokens } from '../keepa/client';
+import { getStaleProductAsins } from '../db/client';
+import { enrichBatch, type DirtySet } from './enrich';
+import { discoverForCategory } from './discover';
+import { recomputeScoresForDirty } from './score-recompute';
+import { recoverPendingDeliveries } from './recovery';
+import { evaluateAndEnqueueAlerts } from './alert-eval';
+
+const STALE_MS = 15 * 60 * 1000;
+const SAFETY_MARGIN = 5;
+const SEARCH_RESERVE = 50;
+const TOKEN_FLOOR = 30;
+const TOKENS_PER_ASIN = 2;
+
+export async function runCron(env: Env): Promise<void> {
+  // Phase 0: recovery sweep (always runs, even on token starvation)
+  await recoverPendingDeliveries(env.DB, env.ALERTS, Date.now()).catch((e) => console.error('[cron:recovery]', e));
+
+  // Phase 1: token check
+  const tokensRemaining = await fetchTokens(env);
+  if (tokensRemaining < TOKEN_FLOOR) {
+    console.log(`[cron] tokens=${tokensRemaining} < ${TOKEN_FLOOR}; skipping enrich+discover`);
+    // Still run alert eval — current_view rows may have changed via prior tick's enrich
+    await evaluateAndEnqueueAlerts(env).catch((e) => console.error('[cron:alert-eval]', e));
+    return;
+  }
+
+  const dirty: DirtySet = new Set();
+
+  // Phase 2: enrich
+  const enrichBudget = Math.max(0, Math.floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / TOKENS_PER_ASIN));
+  let asinsEnriched = 0;
+  if (enrichBudget > 0) {
+    const stale = await getStaleProductAsins(env.DB, Date.now(), STALE_MS, enrichBudget);
+    if (stale.length > 0) {
+      await enrichBatch(env, stale, dirty);
+      asinsEnriched = stale.length;
+    }
+  }
+
+  // Phase 3: discover
+  const tokensAfterEnrichEstimate = tokensRemaining - asinsEnriched * TOKENS_PER_ASIN;
+  if (tokensAfterEnrichEstimate >= SEARCH_RESERVE) {
+    await discoverForCategory(env, 'gpu', dirty);
+  }
+
+  // Phase 4: score recompute
+  await recomputeScoresForDirty(env, dirty);
+
+  // Phase 5: alert eval (may throw; we let it propagate so the Worker logs it)
+  await evaluateAndEnqueueAlerts(env);
+}
+```
+
+- [ ] **Step 2: Re-run cron tests**
+
+```sh
+cd ~/git/sortsafe/worker && bun test pipeline/cron
+```
+
+Existing tests still need to pass — the recovery sweep at the top runs against an empty alert_deliveries table (no-op) and alert eval at the bottom runs against the seeded test rule. Add a new test if you want explicit end-to-end coverage:
+
+```typescript
+it('end-to-end with alert: cron triggers Discord delivery for a 5090 used drop', async () => {
+  // Seed: gpu category + alert rule (already done in seed.sql / Task 14 helper)
+  // Pre-existing snapshots so the median-based metric has data to compare against
+  // ...full test left to author since it composes everything
+});
+```
+
+(Optional — the unit tests in Task 14 already cover the alert path. Skip if time-pressed.)
+
+- [ ] **Step 3: Commit**
+
+```sh
+cd ~/git/sortsafe
+git add worker/src/pipeline/cron.ts
+git commit -m "feat(cron): wire phase 0 (recovery) and phase 5 (alert eval) into orchestrator
+
+— claude-opus-4-7"
+```
+
+---
+
+**End of Chunk 4.** At this point:
+- `cd ~/git/sortsafe/worker && bun test` passes ~70 cases including alert eval, queue consumer, recovery sweep.
+- A cron tick that finds a 5090 used at ≥15% below 30d median enqueues a Discord delivery; queue consumer drains it and posts to webhook.
+- 5xx errors retry via Queues; 4xx errors mark delivered (no infinite retries).
+- Failed enqueue blocks the rule's `last_fired_at` update so recovery sweep picks it up next tick.
+
+Next chunk (5): public read API (`/v1/offers`, `/v1/products`), admin import endpoint, CORS proxy.
+
+---
