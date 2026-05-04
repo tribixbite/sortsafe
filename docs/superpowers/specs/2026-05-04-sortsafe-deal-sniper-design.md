@@ -185,12 +185,17 @@ CREATE INDEX products_category_idx ON products(category_id);
 CREATE INDEX products_model_idx ON products(model);
 
 CREATE TABLE offers (
-  offer_id        TEXT PRIMARY KEY,    -- "{asin}__{condition}__{seller_id_or_empty}" — empty after trailing __ means Keepa-aggregate
+  -- offer_id format: "{asin}__{condition}__{seller_segment}"
+  --   seller_segment = "" (empty) when this is a Keepa-aggregate row (no per-seller data).
+  --     There is at most one Keepa-aggregate row per (asin, condition) — overwrites on upsert.
+  --   seller_segment = "s:{seller_id}" when this is a per-seller row (browser/CLI scrape).
+  --     Multiple rows allowed per (asin, condition), one per seller_id.
+  offer_id        TEXT PRIMARY KEY,
   asin            TEXT NOT NULL REFERENCES products(asin) ON DELETE CASCADE,
   condition       TEXT NOT NULL CHECK (condition IN ('new','used-like-new','used-very-good','used-good','used-acceptable','refurbished','warehouse','unknown')),
   price_usd       REAL NOT NULL,       -- snapshot of latest seen price
-  seller          TEXT,
-  seller_id       TEXT,                -- prefix with 's:' when it's a real Amazon seller_id to avoid collision with sentinel values
+  seller          TEXT,                -- display name; null for Keepa-aggregate rows
+  seller_id       TEXT,                -- raw Amazon seller_id (no prefix); null for Keepa-aggregate rows
   seller_rating   REAL,                -- 0-5
   seller_rating_count INTEGER,
   ships_from      TEXT,
@@ -395,15 +400,24 @@ CREATE INDEX scrape_tasks_avail_idx ON scrape_tasks(claimed_until, completed_at,
         - pct_below_median_*: pct_below_median_* >= threshold
         - pct_off_msrp: pct_off_msrp >= threshold
         - composite_score: composite_score >= threshold
-     c. For each match, build delivery rows:
-        payload_hash = SHA256(rule_id|asin|condition|FLOOR(current_price_usd/threshold_bucket))
+     c. For each match, build delivery rows.
+        threshold_bucket = FLOOR(current_price_usd / 25) * 25  (round to nearest $25)
+        payload_hash = SHA256(rule_id || asin || condition || threshold_bucket)
         For each channel in rule.channels:
           - 'discord' is GLOBAL DEDUPE: only insert one discord row per
-            (offer_id, threshold_bucket) across ALL rules in this tick
-            (dedupe key prefix 'discord|' + offer_id + '|' + threshold_bucket)
-          - 'push'/'email' is per-user
-          INSERT alert_deliveries (delivery_id, rule_id, offer_id, channel, payload_hash, enqueued_at=now)
-          ON CONFLICT (rule_id, payload_hash) WHERE enqueued_at > now - cooldown_s*1000 DO NOTHING
+            (offer_id, threshold_bucket) across ALL rules in this tick.
+            Track within the cron run via an in-memory Set keyed by
+            'discord|' || offer_id || '|' || threshold_bucket.
+          - 'push' / 'email' is per-user.
+        Pre-insert dedupe (cooldown window):
+          INSERT INTO alert_deliveries (delivery_id, rule_id, offer_id, channel, payload_hash, enqueued_at)
+          SELECT ?, ?, ?, ?, ?, ?
+          WHERE NOT EXISTS (
+            SELECT 1 FROM alert_deliveries
+            WHERE rule_id = ?1 AND payload_hash = ?5
+              AND enqueued_at > unixepoch('now') * 1000 - ?cooldown_ms
+          );
+        (Pure SQL conditional insert — no partial unique index needed.)
      d. ATOMIC ENQUEUE BLOCK (per rule):
         Wrap in single try:
           await env.ALERTS.sendBatch(deliveries.map(d => ({body: d.delivery_id})))
@@ -412,7 +426,16 @@ CREATE INDEX scrape_tasks_avail_idx ON scrape_tasks(claimed_until, completed_at,
         and the recovery sweep in step 0 will re-enqueue next tick.
 ```
 
-**Adaptive batching.** Power Plan = 600 tok/hr, 6 cron runs/hr max → 100 tokens/run budget. Reserve 50 for one /search per run, leaves 50 for /product enrichment of ~50 ASINs/run. With ~150 ASINs total across categories at steady state, each ASIN refreshes every ~30 min (3 cron cycles).
+**Adaptive batching.** Power Plan = 600 tok/hr, 6 cron runs/hr max → 100 tokens/run budget. Keepa `/product?stats=180` costs **2 tokens/ASIN** (1 base + 1 for the stats history). Reserve 50 for one /search per run, leaves 50 for ~25 ASINs/run of enrichment. With ~150 ASINs total across categories at steady state, each ASIN refreshes every ~60 min (6 cron cycles).
+
+**N formula:**
+```
+SEARCH_RESERVE = 50  (only when a category is below floor; else 0)
+SAFETY_MARGIN  = 5   (avoid 429s)
+N = max(0, floor((tokensRemaining - SEARCH_RESERVE - SAFETY_MARGIN) / 2))
+```
+
+If 60-min-per-ASIN is too slow once we're tracking watcher SKUs aggressively, the knob is "every 5 min" cron (12 runs/hr) which doubles enrichment throughput at no token cost — but burns more Worker compute and tightens the queue interaction. Defer that decision to Phase 3 when we see real load.
 
 ### 4.1.1 Daily maintenance cron (03:00 UTC)
 
@@ -605,14 +628,22 @@ interface CurrentView {
 ### Composite score formula (default)
 
 ```
-composite_score = (
-    0.50 * normalize(pct_below_median_30d)        // -100..+100 → 0..100
-  + 0.20 * normalize(pct_below_median_90d)
-  + 0.15 * seller_rating_norm                     // 0-5 → 0-100
-  + 0.10 * recency_bonus                          // 100 if last_seen <30min, decays
-  + 0.05 * is_lowest_30d_bonus                    // 100 if true, else 0
-)
+composite_score = sum(weight[i] * value[i]) / sum(weight[i] where value[i] is defined)
 ```
+
+with each component:
+
+| Component | Weight | Source | Null behavior |
+|---|---|---|---|
+| `normalize(pct_below_median_30d)` | 0.50 | current_view | If null (no 30d history yet), drop component AND its weight from denominator |
+| `normalize(pct_below_median_90d)` | 0.20 | current_view | Same — drop both numerator and weight if null |
+| `seller_rating_norm` (0-5 → 0-100) | 0.15 | offers.seller_rating | Drop if null (Keepa-aggregate rows have no seller — don't penalize) |
+| `recency_bonus` (100 if last_seen <30min, linear decay to 0 by 24h) | 0.10 | offers.last_seen | Always defined |
+| `is_lowest_30d_bonus` (100 if true) | 0.05 | current_view.is_lowest_30d | Defined as 0 if 30d history missing |
+
+`normalize(pct)` for the median components: clip to [-50, 100] then map to [0, 100] so a 50% premium reads as 0 and a 100% discount reads as 100. (Negative discount = above median = bad deal.)
+
+When ALL median + seller fields are null (a brand-new ASIN scraped once, no seller breakdown), composite_score = the recency_bonus alone — a low but non-zero signal that says "this exists, we just don't know much yet". Better than a misleading 0.
 
 Score is 0-100. Default sort uses this. UI lets users switch sort/scoring metric per session.
 
@@ -838,7 +869,14 @@ crons = ["*/10 * * * *", "0 3 * * *"]
 - Local Worker: `wrangler dev` — needs `bunx` wrapper (we already have this pattern).
 - SPA dev: `bun run dev` (existing Vite setup).
 - SPA points to local Worker via `?api=http://localhost:8787`.
-- Secrets via `wrangler secret put`: `KEEPA_API_KEY`, `RESEND_API_KEY`, `VAPID_PUBLIC`, `VAPID_PRIVATE`, `SCRAPE_HMAC`, `DISCORD_WEBHOOK_URL` (initial seed; later moved into D1).
+- Secrets via `wrangler secret put`:
+  - `KEEPA_API_KEY` — Keepa Power Plan token.
+  - `RESEND_API_KEY` — Phase 3, email channel.
+  - `VAPID_PUBLIC` / `VAPID_PRIVATE` — Phase 2, web push.
+  - `SCRAPE_HMAC` — shared between Worker and SPA/CLI for `/proxy/amazon` and `/v1/scrape-tasks/*`.
+  - `DISCORD_WEBHOOK_URL` — Phase 1 bootstrap only. The cron handler reads from D1's `discord_config.webhook_url` first; if the row is missing (cold start before §9.3 step 3 runs), it falls back to this secret. Once the D1 row is seeded, the secret can be removed via `wrangler secret delete DISCORD_WEBHOOK_URL`.
+  - `DISCORD_INVITE_URL` — never-expiring invite link to the Discord server hosting `#sortsafe-deals`. Surfaced by the API at `GET /v1/config/discord-invite` and rendered as the "Join the deal channel" button on `/me`.
+  - `JWT_SECRET` — HMAC key for session tokens (§7.3).
 
 ### 9.3 Production rollout
 
@@ -878,16 +916,27 @@ await env.BACKUPS.put(`d1/${date}.ndjson.gz`, await gzip(chunks.join('\n\n')));
 
 ### Phase 1 — "lift cron + add alerts" (target: 1 weekend)
 
-- D1 schema (full schema upfront — cheap to migrate)
-- Worker with: cron handler, /v1/offers GET, /v1/products GET, /proxy/amazon GET, queue consumer
-- Discord webhook dispatch (single shared channel, alerts on % below 30d median ≥ 15 for any used/refurb/warehouse offer on tracked SKUs — hardcoded rule, no per-user UI yet)
-- Pages deployment of existing /gpus SPA, hydrating from /v1/offers instead of static seed
-- Bot-wall detector at every parse boundary
-- R2 backup cron
-- Workers Analytics Engine for token cost + alert dispatch + bot-wall detection events
-- Migration: cut over Termux cron → cloud cron, archive `static/gpus-seed.json`
+**Discord one-time provisioning (do FIRST — alerts can't fire without it):**
+- Author creates a Discord server (or uses an existing one) with a `#sortsafe-deals` channel.
+- Author creates a webhook for that channel; copies URL.
+- Author creates a never-expiring server invite link; copies URL.
+- `wrangler secret put DISCORD_WEBHOOK_URL` (cold-start fallback per §9.2).
+- `wrangler secret put DISCORD_INVITE_URL`.
+- Once D1 is live: `wrangler d1 execute sortsafe-db --remote --command "INSERT INTO discord_config (id, webhook_url, enabled, updated_at) VALUES (1, '<webhook_url>', 1, unixepoch()*1000);"` and (optionally) delete the bootstrap secret.
 
-**Success criteria:** site is reachable from a friend's phone; Discord channel gets a message when 5090 used drops 15%+ below 30d median; cron has run for 24h without error.
+**Build & deploy:**
+- D1 schema (full schema upfront — cheap to migrate; tables we don't use yet are no-ops).
+- Worker with: cron handler (10-min + daily 03:00 UTC), `/v1/offers` GET, `/v1/products` GET, `/proxy/amazon` GET, queue consumer.
+- Hardcoded Phase-1 alert rule seeded into `alert_rules` at deploy time:
+  `(scope='category', scope_value='gpu', metric='pct_below_median_30d', threshold=15, conditions=["used-good","used-very-good","used-like-new","refurbished","warehouse"], channels=["discord"], cooldown_s=1800)`.
+  Bound to a `system` user (no PIN needed for system-owned rules).
+- Pages deployment of existing /gpus SPA, hydrating from `/v1/offers` instead of static seed.
+- Bot-wall detector at every parse boundary.
+- R2 backup cron (NDJSON path per §9.4 Option A).
+- Workers Analytics Engine bindings for token cost + alert dispatch + bot-wall detection events.
+- Migration per §12.
+
+**Success criteria:** site is reachable from a friend's phone; Discord channel gets a message when 5090 used drops 15%+ below 30d median; cron has run for 24h without error; R2 has at least one daily backup written.
 
 ### Phase 2 — "personalization + RAM/SSD" (target: 1 weekend)
 
