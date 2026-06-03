@@ -14,7 +14,6 @@
     "proxy": "bun ./scripts/gpu-proxy-local.ts"
   },
   "devDependencies": {
-    "@rollup/rollup-android-arm64": "4.59.0",
     "@rollup/wasm-node": "4.59.0",
     "@sveltejs/adapter-static": "^3.0.8",
     "@sveltejs/kit": "^2.16.0",
@@ -29,6 +28,9 @@
   },
   "dependencies": {
     "tailwindcss": "^4.0.0"
+  },
+  "optionalDependencies": {
+    "@rollup/rollup-android-arm64": "4.59.0"
   },
   "type": "module"
 }
