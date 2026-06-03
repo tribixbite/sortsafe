@@ -104,7 +104,9 @@ async function seedCategory(slug) {
           el.querySelector("[data-cy=title-recipe]")?.text ||
           el.querySelectorAll("h2").map((h) => h.text).join(" ") ||
           ""
-        ).trim();
+        )
+          .replace(/^sponsored(\s+ad)?\s*[-:]\s*/i, "")
+          .trim();
         const variant = classify(cfg, title);
         if (variant !== v.id) continue; // wrong variant / accessory
         const price = priceUsd(el.querySelector(".a-price .a-offscreen")?.text);
