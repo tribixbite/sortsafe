@@ -1,0 +1,27 @@
+name: Deploy Worker (proxy)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - "scripts/deploy-worker.mjs"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Deploys worker/index.mjs via the Cloudflare REST API (no wrangler).
+      - name: Deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: node scripts/deploy-worker.mjs
