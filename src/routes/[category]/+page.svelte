@@ -21,7 +21,7 @@
 	let minSellerRating = $state(0);
 	let goodDealOnly = $state(false);
 	let maxPrice = $state(0); // 0 = no ceiling; set after load
-	let sortKey: 'price' | 'price-desc' | 'discount' | 'rating' | 'last_seen' = $state('price');
+	let sortKey: 'price' | 'price-desc' | 'discount' | 'value' | 'rating' | 'last_seen' = $state('price');
 
 	let abortCtl: AbortController | null = null;
 
@@ -73,12 +73,33 @@
 		return r ? ((r - o.price_usd) / r) * 100 : null;
 	}
 	function isGoodDeal(o: Offer): boolean {
+		// Unknown rating passes (don't require a rating we don't have).
 		const d = discountPct(o);
-		return d != null && d >= 25 && (o.seller_rating ?? 0) >= 4.3;
+		return d != null && d >= 25 && (o.seller_rating == null || o.seller_rating >= 4.3);
 	}
 	function variantLabel(id: string): string {
 		return cfg.variants.find((v) => v.id === id)?.label ?? id;
 	}
+	/** Price per capacity unit ($/TB, $/GB), when the category + title support it. */
+	function valuePerUnit(o: Offer): number | null {
+		if (!cfg.unit) return null;
+		const q = cfg.unit.parse(o.title);
+		return q && q > 0 ? o.price_usd / q : null;
+	}
+
+	// Data-driven facets: only surface filters/options the data actually supports.
+	const hasRatings = $derived(offers.some((o) => o.seller_rating != null));
+	const presentConditions = $derived([...new Set(offers.map((o) => o.condition))]);
+	const variantCount = $derived.by(() => {
+		const m = new Map<string, number>();
+		for (const o of offers) m.set(o.variant, (m.get(o.variant) ?? 0) + 1);
+		return m;
+	});
+	const conditionCount = $derived.by(() => {
+		const m = new Map<string, number>();
+		for (const o of offers) m.set(o.condition, (m.get(o.condition) ?? 0) + 1);
+		return m;
+	});
 
 	const filtered = $derived.by(() => {
 		const out = offers.filter((o) => {
@@ -86,10 +107,11 @@
 			if (conditionFilter !== 'all' && o.condition !== conditionFilter) return false;
 			if (hideNew && o.condition === 'new') return false;
 			if (maxPrice && o.price_usd > maxPrice) return false;
-			if ((o.seller_rating ?? 0) < minSellerRating) return false;
+			// Only exclude on rating when the offer actually has one (null passes).
+			if (minSellerRating && o.seller_rating != null && o.seller_rating < minSellerRating) return false;
 			if (hasRef) {
 				const d = discountPct(o);
-				if (d != null && d < minDiscountPct) return false;
+				if (minDiscountPct > -300 && d != null && d < minDiscountPct) return false;
 				if (goodDealOnly && !isGoodDeal(o)) return false;
 			}
 			return true;
@@ -98,6 +120,7 @@
 			switch (sortKey) {
 				case 'price': return a.price_usd - b.price_usd;
 				case 'price-desc': return b.price_usd - a.price_usd;
+				case 'value': return (valuePerUnit(a) ?? 1e12) - (valuePerUnit(b) ?? 1e12);
 				case 'rating': return (b.seller_rating ?? 0) - (a.seller_rating ?? 0);
 				case 'last_seen': return b.last_seen - a.last_seen;
 				case 'discount':
@@ -146,36 +169,46 @@
 
 	<section class="filters">
 		<label>
-			<span>{cfg.short === 'GPUs' ? 'Model' : 'Type'}</span>
+			<span>{cfg.referencePrices ? 'Model' : 'Type'}</span>
 			<select bind:value={variantFilter}>
-				<option value="all">All</option>
-				{#each cfg.variants as v (v.id)}<option value={v.id}>{v.label}</option>{/each}
+				<option value="all">All ({offers.length})</option>
+				{#each cfg.variants.filter((v) => (variantCount.get(v.id) ?? 0) > 0) as v (v.id)}
+					<option value={v.id}>{v.label} ({variantCount.get(v.id)})</option>
+				{/each}
 			</select>
 		</label>
-		<label>
-			<span>Condition</span>
-			<select bind:value={conditionFilter}>
-				<option value="all">All</option>
-				{#each Object.entries(CONDITION_LABELS) as [k, lbl]}<option value={k}>{lbl}</option>{/each}
-			</select>
-		</label>
+		{#if presentConditions.length > 1}
+			<label>
+				<span>Condition</span>
+				<select bind:value={conditionFilter}>
+					<option value="all">All</option>
+					{#each presentConditions as c}
+						<option value={c}>{CONDITION_LABELS[c as Condition]} ({conditionCount.get(c)})</option>
+					{/each}
+				</select>
+			</label>
+		{/if}
 		<label>
 			<span>Max price <output>{fmtPrice(maxPrice)}</output></span>
 			<input type="range" min="0" max={priceCeiling} step="25" bind:value={maxPrice} />
 		</label>
 		{#if hasRef}
 			<label>
-				<span>Min % off {cfg.referenceLabel} <output>{minDiscountPct}%</output></span>
+				<span>Min % off {cfg.referenceLabel} <output>{minDiscountPct <= -300 ? 'Any' : `${minDiscountPct}%`}</output></span>
 				<input type="range" min="-300" max="80" step="5" bind:value={minDiscountPct} />
 			</label>
 		{/if}
-		<label>
-			<span>Min seller ★ <output>{minSellerRating.toFixed(1)}</output></span>
-			<input type="range" min="0" max="5" step="0.1" bind:value={minSellerRating} />
-		</label>
-		<label class="checkbox"><input type="checkbox" bind:checked={hideNew} /><span>Hide "new"</span></label>
+		{#if hasRatings}
+			<label>
+				<span>Min seller ★ <output>{minSellerRating.toFixed(1)}</output></span>
+				<input type="range" min="0" max="5" step="0.1" bind:value={minSellerRating} />
+			</label>
+		{/if}
+		{#if presentConditions.length > 1}
+			<label class="checkbox"><input type="checkbox" bind:checked={hideNew} /><span>Hide "new"</span></label>
+		{/if}
 		{#if hasRef}
-			<label class="checkbox"><input type="checkbox" bind:checked={goodDealOnly} /><span>Good deals only (≥25% off + ≥4.3★)</span></label>
+			<label class="checkbox"><input type="checkbox" bind:checked={goodDealOnly} /><span>Good deals only (≥25% off)</span></label>
 		{/if}
 		<label class="sort">
 			<span>Sort</span>
@@ -183,7 +216,8 @@
 				{#if hasRef}<option value="discount">% off {cfg.referenceLabel} ↓</option>{/if}
 				<option value="price">Price ↑</option>
 				<option value="price-desc">Price ↓</option>
-				<option value="rating">Seller ★ ↓</option>
+				{#if cfg.unit}<option value="value">$/{cfg.unit.per} ↑</option>{/if}
+				{#if hasRatings}<option value="rating">Seller ★ ↓</option>{/if}
 				<option value="last_seen">Recently seen ↓</option>
 			</select>
 		</label>
@@ -196,8 +230,9 @@
 			{@const d = discountPct(o)}
 			{@const good = isGoodDeal(o)}
 			{@const prod = products.get(o.asin)}
+			{@const vpu = valuePerUnit(o)}
 			<a class="card" class:good href={`https://www.amazon.com/dp/${o.asin}`} target="_blank" rel="noopener">
-				<div class="thumb">
+				<div class="thumb" class:empty={!prod?.thumbnail_url}>
 					{#if prod?.thumbnail_url}<img src={prod.thumbnail_url} alt={o.title || o.asin} loading="lazy" />{/if}
 				</div>
 				<div class="meta">
@@ -205,6 +240,7 @@
 						<span class="model">{variantLabel(o.variant)}</span>
 						<span class="price">{fmtPrice(o.price_usd)}</span>
 						{#if d != null}<span class="discount" class:positive={d > 0} class:negative={d < 0}>{d > 0 ? '−' : '+'}{Math.abs(d).toFixed(0)}%</span>{/if}
+						{#if vpu != null}<span class="vpu">${vpu < 10 ? vpu.toFixed(2) : Math.round(vpu)}/{cfg.unit?.per}</span>{/if}
 						{#if good}<span class="badge">DEAL</span>{/if}
 					</div>
 					{#if o.title}<div class="ptitle">{o.title}</div>{/if}
@@ -255,6 +291,9 @@
 	.card.good { border-color: var(--deal-green); box-shadow: 0 0 0 1px var(--deal-green) inset; }
 	.thumb { aspect-ratio: 1.4; background: #fff; display: flex; align-items: center; justify-content: center; }
 	.thumb img { max-width: 100%; max-height: 100%; object-fit: contain; }
+	.thumb.empty { background: var(--bg-tertiary); }
+	.thumb.empty::after { content: 'no image'; color: var(--text-muted); font-size: 0.72rem; letter-spacing: 0.03em; }
+	.vpu { color: var(--text-secondary); font-size: 0.8rem; font-variant-numeric: tabular-nums; }
 	.meta { padding: 0.55rem; display: flex; flex-direction: column; gap: 0.25rem; font-size: 0.78rem; }
 	.row1 { display: flex; gap: 0.4rem; align-items: baseline; flex-wrap: wrap; font-variant-numeric: tabular-nums; }
 	.model { color: var(--text-secondary); font-weight: 600; }

@@ -20,6 +20,22 @@ export interface CategoryConfig {
   /** Reference price per variant (only where a real launch MSRP exists). */
   referencePrices?: Record<string, number>;
   referenceLabel?: string; // e.g. "MSRP"
+  /** Value metric — price per capacity unit parsed from the title (e.g. $/TB,
+   *  $/GB). Enables a "$/unit" badge + sort for categories where it's meaningful. */
+  unit?: { per: string; parse: (title: string) => number | null };
+}
+
+/** Largest GB figure in a title (the total kit/drive size, not a single stick). */
+function gbFromTitle(title: string): number | null {
+  const all = [...title.matchAll(/(\d+(?:\.\d+)?)\s*GB/gi)].map((m) => parseFloat(m[1]));
+  return all.length ? Math.max(...all) : null;
+}
+/** Capacity in TB (handles "4TB" and "512GB"). */
+function tbFromTitle(title: string): number | null {
+  const tb = title.match(/(\d+(?:\.\d+)?)\s*TB/i);
+  if (tb) return parseFloat(tb[1]);
+  const gb = gbFromTitle(title);
+  return gb ? gb / 1000 : null;
 }
 
 export const CATEGORIES: CategoryConfig[] = [
@@ -44,6 +60,7 @@ export const CATEGORIES: CategoryConfig[] = [
     short: "RAM",
     desc: "Desktop DDR5 & DDR4 memory kits — by generation, new & used",
     accessory: /heat\s*sink only|rgb fan|cooler|^cable|adapter|so-?dimm|laptop|server ecc|fan kit/i,
+    unit: { per: "GB", parse: gbFromTitle },
     variants: [
       { id: "DDR5", label: "DDR5", search: "ddr5 desktop ram kit", match: /\bddr5\b/i },
       { id: "DDR4", label: "DDR4", search: "ddr4 desktop ram kit", match: /\bddr4\b/i },
@@ -55,6 +72,7 @@ export const CATEGORIES: CategoryConfig[] = [
     short: "SSDs",
     desc: "NVMe solid-state drives — 1TB / 2TB / 4TB, new & used",
     accessory: /enclosure|heat\s*sink only|adapter|^cable|dock|caddy|bracket|screw/i,
+    unit: { per: "TB", parse: tbFromTitle },
     variants: [
       { id: "4TB", label: "4 TB", search: "nvme ssd 4tb", match: /\b4\s*tb\b/i },
       { id: "2TB", label: "2 TB", search: "nvme ssd 2tb", match: /\b2\s*tb\b/i },
