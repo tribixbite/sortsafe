@@ -41,6 +41,9 @@ export interface Offer {
   first_seen: number;
   last_seen: number;
   is_buybox: boolean;
+  /** Client-only: true when this record came from the static seed (not a live
+   *  user refresh). Lets hydrate prune the previous seed cleanly. */
+  seeded?: boolean;
 }
 
 export interface Product {
@@ -50,6 +53,7 @@ export interface Product {
   title: string;
   thumbnail_url: string | null;
   last_refreshed: number;
+  seeded?: boolean;
 }
 
 export interface PriceSnapshot {

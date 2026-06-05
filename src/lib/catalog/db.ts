@@ -17,14 +17,16 @@ export interface CatalogDb {
 
 export function catalogDb(category: string): CatalogDb {
   const DB_NAME = `sortsafe-${category}`;
-  const DB_VERSION = 1;
+  // v2: purge stores on upgrade so returning visitors don't keep stale offers
+  // from a previous seed whose ASINs aren't in the current one.
+  const DB_VERSION = 2;
   let openPromise: Promise<IDBDatabase> | null = null;
 
   function open(): Promise<IDBDatabase> {
     if (openPromise) return openPromise;
     openPromise = new Promise((resolve, reject) => {
       const req = indexedDB.open(DB_NAME, DB_VERSION);
-      req.onupgradeneeded = () => {
+      req.onupgradeneeded = (event) => {
         const db = req.result;
         if (!db.objectStoreNames.contains("offers")) {
           const s = db.createObjectStore("offers", { keyPath: "offer_id" });
@@ -40,6 +42,12 @@ export function catalogDb(category: string): CatalogDb {
           const s = db.createObjectStore("snapshots", { keyPath: "id", autoIncrement: true });
           s.createIndex("asin", "asin");
           s.createIndex("taken_at", "taken_at");
+        }
+        // Existing v1 DBs: clear carried-over offers/products (one-time migration).
+        if (event.oldVersion >= 1 && event.oldVersion < 2) {
+          const t = req.transaction;
+          t?.objectStore("offers").clear();
+          t?.objectStore("products").clear();
         }
       };
       req.onerror = () => reject(req.error);
@@ -91,6 +99,28 @@ export function catalogDb(category: string): CatalogDb {
   /** Replace all offers for each ASIN present in the seed (so sold/stale
    *  listings vanish), then insert the fresh seed. Legacy GPU seeds use a
    *  `model` field — normalize it to `variant` + stamp `category`. */
+  /** Delete every record in a store that was inserted by a prior seed. */
+  async function clearSeeded(store: StoreName): Promise<number> {
+    const t = await tx([store], "readwrite");
+    let n = 0;
+    await new Promise<void>((resolve, reject) => {
+      const req = t.objectStore(store).openCursor();
+      req.onsuccess = () => {
+        const cur = req.result;
+        if (cur) {
+          if ((cur.value as { seeded?: boolean }).seeded) {
+            cur.delete();
+            n++;
+          }
+          cur.continue();
+        } else resolve();
+      };
+      req.onerror = () => reject(req.error);
+    });
+    await done(t);
+    return n;
+  }
+
   async function hydrateFromSeed(seedUrl: string) {
     let res: Response;
     try {
@@ -105,39 +135,20 @@ export function catalogDb(category: string): CatalogDb {
     };
     if (!seed?.offers?.length) return null;
 
-    const norm = <T extends { model?: string; variant?: string; category?: string }>(x: T): T => {
+    // Normalize legacy `model`→`variant`, stamp category, and mark provenance
+    // so the next hydrate can drop the *entire* previous seed (not just shared
+    // ASINs) while leaving the user's own "Refresh from Amazon" results intact.
+    const norm = <T extends { model?: string; variant?: string; category?: string; seeded?: boolean }>(x: T): T => {
       x.variant = x.variant ?? x.model ?? "";
       x.category = x.category ?? category;
+      x.seeded = true;
       return x;
     };
     const offers = seed.offers.map(norm) as Offer[];
     const products = (seed.products ?? []).map(norm) as Product[];
 
-    const seedAsins = new Set<string>();
-    for (const o of offers) seedAsins.add(o.asin);
-    for (const p of products) seedAsins.add(p.asin);
-
-    let deleted = 0;
-    if (seedAsins.size) {
-      const t = await tx(["offers"], "readwrite");
-      const idx = t.objectStore("offers").index("asin");
-      await new Promise<void>((resolve, reject) => {
-        let pending = seedAsins.size;
-        for (const asin of seedAsins) {
-          const req = idx.openCursor(IDBKeyRange.only(asin));
-          req.onsuccess = () => {
-            const cur = req.result;
-            if (cur) {
-              cur.delete();
-              deleted++;
-              cur.continue();
-            } else if (--pending === 0) resolve();
-          };
-          req.onerror = () => reject(req.error);
-        }
-      });
-      await done(t);
-    }
+    // Drop every previously-seeded record (any ASIN) before inserting the new seed.
+    const deleted = (await clearSeeded("offers")) + (await clearSeeded("products"));
 
     await putOffers(offers);
     if (products.length) {

@@ -52,23 +52,33 @@ export default {
     const cached = await cache.match(cacheKey);
     if (cached) return withCors(cached);
 
+    // Amazon intermittently bot-walls with a tiny 503/429 "robot check" page.
+    // Retry a few times — Cloudflare may egress from a different IP, and the
+    // wall is partly probabilistic — until we get a real (>50 KB) 200 body.
     let upstream;
-    try {
-      upstream = await fetch(t.toString(), {
-        headers: {
-          "user-agent": UA,
-          accept: ACCEPT,
-          "accept-language": "en-US,en;q=0.9",
-          "upgrade-insecure-requests": "1",
-        },
-        redirect: "follow",
-        cf: { cacheTtl: 300, cacheEverything: true },
-      });
-    } catch (e) {
-      return new Response(`upstream fetch failed: ${e}`, { status: 502, headers: CORS });
+    let body = "";
+    for (let attempt = 0; attempt < 4; attempt++) {
+      try {
+        upstream = await fetch(t.toString(), {
+          headers: {
+            "user-agent": UA,
+            accept: ACCEPT,
+            "accept-language": "en-US,en;q=0.9",
+            "upgrade-insecure-requests": "1",
+          },
+          redirect: "follow",
+          cf: { cacheTtl: 0, cacheEverything: false },
+        });
+      } catch (e) {
+        if (attempt === 3) return new Response(`upstream fetch failed: ${e}`, { status: 502, headers: CORS });
+        continue;
+      }
+      body = await upstream.text();
+      // Good enough: a real page is large; bot-check pages are a few KB.
+      if (upstream.status === 200 && body.length > 50000) break;
+      if (attempt < 3) await new Promise((r) => setTimeout(r, 400 + attempt * 400));
     }
-
-    const body = await upstream.text();
+    if (!upstream) return new Response("no upstream response", { status: 502, headers: CORS });
     const headers = new Headers(CORS);
     headers.set("content-type", upstream.headers.get("content-type") || "text/html; charset=utf-8");
     headers.set("x-proxy-status", String(upstream.status));
